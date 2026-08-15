@@ -113,3 +113,41 @@ size_t pack_idx8(const uint8_t *indices, int rows, int cols, uint8_t *out)
     }
     return n;
 }
+
+/* -------------------------------------------------------------------------
+ * sanitize_name — turn a tensor name into a filename component.
+ *
+ * The safetensors format allows tensor names to contain dots and
+ * (rarely) slashes, neither of which are safe in a path component on
+ * any host filesystem. We rewrite both '.' and '/' (plus '\\' for
+ * Windows-style separators) to '_', then truncate to dstsz-1 chars and
+ * NUL-terminate. Other characters (including spaces, dashes, brackets)
+ * are left untouched — callers that need stricter sanitisation can
+ * post-process.
+ *
+ * The function is safe to call with a NULL source or a zero-sized
+ * destination; in either case it becomes a no-op.
+ * ------------------------------------------------------------------------- */
+void sanitize_name(const char *src, char *dst, size_t dstsz)
+{
+    if (dst == NULL || dstsz == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    size_t i = 0;
+    for (; i + 1 < dstsz; i++) {
+        char c = src[i];
+        if (c == '\0') {
+            break;
+        }
+        if (c == '.' || c == '/' || c == '\\') {
+            c = '_';
+        }
+        dst[i] = c;
+    }
+    dst[i] = '\0';
+}

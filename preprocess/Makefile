@@ -16,21 +16,21 @@ PRE_OBJS := preprocess.o png.o ../safetensors/json.o
 all: test_preprocess
 
 ../safetensors/json.o: ../safetensors/json.c ../safetensors/json.h
-	$(CC) $(CFLAGS) $(INCLUDE) -c -o $@ ../safetensors/json.c
+        $(CC) $(CFLAGS) $(INCLUDE) -c -o $@ ../safetensors/json.c
 
 preprocess.o: preprocess.c preprocess.h png.h fp16.h
-	$(CC) $(CFLAGS) $(INCLUDE) -c -o $@ preprocess.c
+        $(CC) $(CFLAGS) $(INCLUDE) -c -o $@ preprocess.c
 
 png.o: png.c png.h
-	$(CC) $(CFLAGS) $(INCLUDE) -c -o $@ png.c
+        $(CC) $(CFLAGS) $(INCLUDE) -c -o $@ png.c
 
 test_preprocess: test_preprocess.c $(PRE_OBJS)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ test_preprocess.c $(PRE_OBJS) $(LDLIBS)
+        $(CC) $(CFLAGS) $(INCLUDE) -o $@ test_preprocess.c $(PRE_OBJS) $(LDLIBS)
 
 run: test_preprocess
-	./test_preprocess
+        ./test_preprocess
 
 clean:
-	rm -f *.o test_preprocess
+        rm -f *.o test_preprocess ../safetensors/json.o
 
 .PHONY: all run clean

@@ -1,7 +1,9 @@
 /* json.c -- minimal recursive-descent JSON parser for auto_lut.
  *
- * Stage 4 (subtask 4): json_parse public entry (object parser).
- * Parses any top-level JSON value; rejects trailing garbage.
+ * Stage 5 (subtask 5): accessors.
+ *   - json_obj_get: key lookup in object
+ *   - json_get_num: numeric accessor with default (accepts NUM and BOOL)
+ *   - json_get_str: string accessor with default
  */
 
 #include "json.h"
@@ -28,11 +30,8 @@ static void json_skip_ws(Parser *s)
 {
     while (s->p < s->end) {
         char c = *s->p;
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            s->p++;
-        } else {
-            break;
-        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { s->p++; }
+        else break;
     }
 }
 
@@ -254,7 +253,6 @@ static JsonValue *json_parse_value(Parser *s)
     }
 }
 
-/* ---- subtask 4: public entry point ---- */
 JsonValue *json_parse(const char *str)
 {
     if (!str) return NULL;
@@ -264,15 +262,36 @@ JsonValue *json_parse(const char *str)
     JsonValue *v = json_parse_value(&s);
     if (!v) return NULL;
     json_skip_ws(&s);
-    if (s.error || s.p != s.end) {
-        json_free(v);
-        return NULL;
-    }
+    if (s.error || s.p != s.end) { json_free(v); return NULL; }
     return v;
 }
 
-/* stubs -- filled in by subsequent subtasks */
-JsonValue *json_obj_get(JsonValue *obj, const char *key) { (void)obj; (void)key; return NULL; }
-double json_get_num(JsonValue *obj, const char *key, double def) { (void)obj; (void)key; return def; }
-const char *json_get_str(JsonValue *obj, const char *key, const char *def) { (void)obj; (void)key; return def; }
+/* ---- subtask 5: accessors ---- */
+JsonValue *json_obj_get(JsonValue *obj, const char *key)
+{
+    if (!obj || obj->type != JSON_OBJ || !key) return NULL;
+    for (int i = 0; i < obj->obj_len; i++) {
+        if (strcmp(obj->keys[i], key) == 0)
+            return obj->vals[i];
+    }
+    return NULL;
+}
+
+double json_get_num(JsonValue *obj, const char *key, double def)
+{
+    JsonValue *v = json_obj_get(obj, key);
+    if (!v) return def;
+    if (v->type == JSON_NUM)  return v->num;
+    if (v->type == JSON_BOOL) return v->num;
+    return def;
+}
+
+const char *json_get_str(JsonValue *obj, const char *key, const char *def)
+{
+    JsonValue *v = json_obj_get(obj, key);
+    if (!v || v->type != JSON_STR) return def;
+    return v->str;
+}
+
+/* stub -- filled in by next subtask */
 void json_free(JsonValue *v) { (void)v; }

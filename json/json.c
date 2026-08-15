@@ -1,9 +1,8 @@
 /* json.c -- minimal recursive-descent JSON parser for auto_lut.
  *
- * Stage 2 (subtask 2): parser scaffolding + primitives.
- *   - Parser struct
- *   - json_skip_ws, json_parse_string, json_parse_number
- *   - Stub public API (filled in later subtasks)
+ * Stage 3 (subtask 3): json_parse_value dispatcher.
+ * Dispatches by first char to object, array, string, number, bool, null.
+ * Object and array parsers are inlined here for clarity.
  */
 
 #include "json.h"
@@ -159,8 +158,124 @@ static JsonValue *json_parse_number(Parser *s)
     return v;
 }
 
+static JsonValue *json_parse_value(Parser *s)
+{
+    json_skip_ws(s);
+    if (s->p >= s->end) { s->error = 1; return NULL; }
+    char c = *s->p;
+
+    switch (c) {
+        case '{': {
+            s->p++;
+            JsonValue *v = new_value(JSON_OBJ);
+            if (!v) { s->error = 1; return NULL; }
+            size_t cap = 0;
+            json_skip_ws(s);
+            if (s->p < s->end && *s->p == '}') { s->p++; return v; }
+            for (;;) {
+                json_skip_ws(s);
+                if (s->p >= s->end || *s->p != '"') { json_free(v); s->error = 1; return NULL; }
+                int key_len = 0;
+                char *key = json_parse_string(s, &key_len);
+                if (!key) { json_free(v); return NULL; }
+                json_skip_ws(s);
+                if (s->p >= s->end || *s->p != ':') { free(key); json_free(v); s->error = 1; return NULL; }
+                s->p++;
+                json_skip_ws(s);
+                JsonValue *val = json_parse_value(s);
+                if (!val) { free(key); json_free(v); return NULL; }
+                if (v->obj_len == (int)cap) {
+                    size_t newcap = cap ? cap * 2 : 8;
+                    char **nk = (char **)realloc(v->keys, newcap * sizeof(*nk));
+                    if (nk) v->keys = nk;
+                    JsonValue **nv = (JsonValue **)realloc(v->vals, newcap * sizeof(*nv));
+                    if (nv) v->vals = nv;
+                    if (!nk || !nv) { free(key); json_free(val); json_free(v); s->error = 1; return NULL; }
+                    cap = newcap;
+                }
+                v->keys[v->obj_len] = key;
+                v->vals[v->obj_len] = val;
+                v->obj_len++;
+                json_skip_ws(s);
+                if (s->p >= s->end) { json_free(v); s->error = 1; return NULL; }
+                if (*s->p == ',') { s->p++; continue; }
+                if (*s->p == '}') { s->p++; return v; }
+                json_free(v); s->error = 1; return NULL;
+            }
+        }
+
+        case '[': {
+            s->p++;
+            JsonValue *v = new_value(JSON_ARR);
+            if (!v) { s->error = 1; return NULL; }
+            size_t cap = 0;
+            json_skip_ws(s);
+            if (s->p < s->end && *s->p == ']') { s->p++; return v; }
+            for (;;) {
+                JsonValue *item = json_parse_value(s);
+                if (!item) { json_free(v); return NULL; }
+                if (v->arr_len == (int)cap) {
+                    size_t newcap = cap ? cap * 2 : 8;
+                    JsonValue **t = (JsonValue **)realloc(v->arr, newcap * sizeof(*t));
+                    if (!t) { json_free(item); json_free(v); s->error = 1; return NULL; }
+                    v->arr = t;
+                    cap = newcap;
+                }
+                v->arr[v->arr_len++] = item;
+                json_skip_ws(s);
+                if (s->p >= s->end) { json_free(v); s->error = 1; return NULL; }
+                if (*s->p == ',') { s->p++; continue; }
+                if (*s->p == ']') { s->p++; return v; }
+                json_free(v); s->error = 1; return NULL;
+            }
+        }
+
+        case '"': {
+            JsonValue *v = new_value(JSON_STR);
+            if (!v) { s->error = 1; return NULL; }
+            int slen = 0;
+            v->str = json_parse_string(s, &slen);
+            if (!v->str) { free(v); return NULL; }
+            v->str_len = slen;
+            return v;
+        }
+
+        case 't':
+            if (s->p + 4 <= s->end && memcmp(s->p, "true", 4) == 0) {
+                s->p += 4;
+                JsonValue *v = new_value(JSON_BOOL);
+                if (!v) { s->error = 1; return NULL; }
+                v->num = 1.0;
+                return v;
+            }
+            s->error = 1; return NULL;
+
+        case 'f':
+            if (s->p + 5 <= s->end && memcmp(s->p, "false", 5) == 0) {
+                s->p += 5;
+                JsonValue *v = new_value(JSON_BOOL);
+                if (!v) { s->error = 1; return NULL; }
+                v->num = 0.0;
+                return v;
+            }
+            s->error = 1; return NULL;
+
+        case 'n':
+            if (s->p + 4 <= s->end && memcmp(s->p, "null", 4) == 0) {
+                s->p += 4;
+                JsonValue *v = new_value(JSON_NULL);
+                if (!v) { s->error = 1; return NULL; }
+                return v;
+            }
+            s->error = 1; return NULL;
+
+        default:
+            if (c == '-' || (c >= '0' && c <= '9')) return json_parse_number(s);
+            s->error = 1; return NULL;
+    }
+}
+
 /* stubs -- filled in by subsequent subtasks */
-static JsonValue *json_parse_value(Parser *s) { (void)s; return NULL; }
 JsonValue *json_parse(const char *str) { (void)str; return NULL; }
 JsonValue *json_obj_get(JsonValue *obj, const char *key) { (void)obj; (void)key; return NULL; }
 double json_get_num(JsonValue *obj, const char *key, double def) { (void)obj; (void)key; return def; }

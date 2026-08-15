@@ -228,7 +228,6 @@ SafeTensors *safetensors_load(const char *path)
             break;
         }
         TensorInfo *ti = &tensors[idx];
-        set_tensor_name(ti, key);
         if (fill_tensor_info(ti, val, data_start) != 0) {
             fprintf(stderr, "safetensors_load: malformed tensor info for '%s'\n",
                     key);
@@ -236,6 +235,7 @@ SafeTensors *safetensors_load(const char *path)
             json_free(root);
             return NULL;
         }
+        set_tensor_name(ti, key);
         /* Bounds-check the tensor's bytes against the mapping. */
         if (ti->byte_offset + ti->byte_size > file_size) {
             fprintf(stderr, "safetensors_load: tensor '%s' bytes exceed file_size\n",

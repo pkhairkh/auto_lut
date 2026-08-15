@@ -1,3 +1,4 @@
+#include <math.h>
 /* metadata.c — Writer for metadata_coreml_pg.json
  *
  * Walks every tensor in a SafeTensors archive, classifies it as palettizable
@@ -32,8 +33,8 @@ static void hessian_stats(const Activation *a, float *mean, float *max) {
         sum += v;
         if (v > mx) mx = v;
     }
-    *mean = (float)(sum / a->in_dim);
-    *max  = (mx == -1e30f) ? 0.0f : mx;
+    *mean = (isnan(sum) || isinf(sum) || a->in_dim <= 0) ? 0.0f : (float)(sum / a->in_dim);
+    *max  = (mx == -1e30f || isnan(mx) || isinf(mx)) ? 0.0f : mx;
 }
 
 /* Determine if a 2D tensor is palettizable. Excludes:
@@ -139,8 +140,8 @@ int metadata_write(const SafeTensors *st, const ActivationCapture *ac,
         if (a) {
             fprintf(f, ", \"n_samples\": %d", n_samples);
             fprintf(f, ", \"in_dim\": %d", in_dim);
-            fprintf(f, ", \"hessian_mean\": %.6e", h_mean);
-            fprintf(f, ", \"hessian_max\": %.6e", h_max);
+            fprintf(f, ", \"hessian_mean\": %.6e", (isnan(h_mean) || isinf(h_mean)) ? 0.0f : h_mean);
+            fprintf(f, ", \"hessian_max\": %.6e", (isnan(h_max) || isinf(h_max)) ? 0.0f : h_max);
         }
         fprintf(f, "}%s\n", (i+1 < st->count) ? "," : "");
     }

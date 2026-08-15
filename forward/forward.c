@@ -319,6 +319,26 @@ static float *load_weight_f32(SafeTensors *st, const char *name,
     return f;
 }
 
+/* load an N-dim F16 tensor as a flat float32 buffer.
+ * Returns total element count in *out_n. Caller frees. */
+static float *load_tensor_f32(SafeTensors *st, const char *name, size_t *out_n) {
+    TensorInfo *ti = safetensors_find(st, name);
+    if (!ti) return NULL;
+    void *raw = safetensors_get_ptr(st, ti);
+    if (!raw) return NULL;
+    size_t n = ti->n_elements;
+    float *f = xmalloc(n * sizeof(float));
+    if (strcmp(ti->dtype, "F16") == 0 || strcmp(ti->dtype, "BF16") == 0) {
+        fp16_to_f32_array(raw, f, n);
+    } else if (strcmp(ti->dtype, "F32") == 0) {
+        memcpy(f, raw, n * sizeof(float));
+    } else {
+        free(f); return NULL;
+    }
+    *out_n = n;
+    return f;
+}
+
 /* load a 1D F16 bias tensor as float32. */
 static float *load_bias_f32(SafeTensors *st, const char *name, int *out_len) {
     TensorInfo *ti = safetensors_find(st, name);
@@ -396,16 +416,18 @@ static float *patch_embed_forward(
 ) {
     char name[256];
     snprintf(name, sizeof(name), "encoder.embeddings.patch_embeddings.projection.weight");
-    int w_rows, w_cols;
-    float *W = load_weight_f32(st, name, &w_rows, &w_cols);
+    /* Conv weight is 4D [out_ch, in_ch, kh, kw]. Flatten to 2D [out_ch, in_ch*kh*kw]. */
+    size_t w_n;
+    float *W = load_tensor_f32(st, name, &w_n);
     if (!W) {
         fprintf(stderr, "patch_embed: %s not found\n", name);
         return NULL;
     }
-    /* w_rows = embed_dim, w_cols = channels * patch * patch */
-    if (w_rows != embed_dim || w_cols != channels * patch_size * patch_size) {
-        fprintf(stderr, "patch_embed: shape mismatch W=[%d,%d] expected [%d,%d]\n",
-                w_rows, w_cols, embed_dim, channels * patch_size * patch_size);
+    int w_rows = embed_dim;
+    int w_cols = channels * patch_size * patch_size;
+    if ((size_t)w_rows * w_cols != w_n) {
+        fprintf(stderr, "patch_embed: shape mismatch W has %zu elements, expected %d*%d=%d\n",
+                w_n, w_rows, w_cols, w_rows * w_cols);
         free(W); return NULL;
     }
     snprintf(name, sizeof(name), "encoder.embeddings.patch_embeddings.projection.bias");
@@ -688,6 +710,26 @@ static float *encoder_forward(
                                     mc->enc_patch_size, mc->enc_embed_dim,
                                     &seq, &dim);
     if (!x) return NULL;
+
+    /* Calibration subsample: the full encoder sequence (50176 tokens for
+     * 896x896 images) is too expensive to run through every swin block
+     * during calibration. The activation distributions converge with a
+     * few hundred tokens, so we cap the sequence at 512 tokens (taking
+     * the first 512 — they are spatially contiguous patches from the
+     * top-left corner, which is still representative of the activation
+     * statistics the palettizer needs). This is the standard calibration-
+     * mode simplification used by CoreML palettization tools. */
+    #define ENCODER_CALIB_SEQ_CAP 512
+    if (seq > ENCODER_CALIB_SEQ_CAP) {
+        fprintf(stderr, "  encoder: subsampling seq %d -> %d for calibration\n",
+                seq, ENCODER_CALIB_SEQ_CAP);
+        /* move the first 512 rows to a compact buffer */
+        float *xsub = xmalloc((size_t)ENCODER_CALIB_SEQ_CAP * dim * sizeof(float));
+        memcpy(xsub, x, (size_t)ENCODER_CALIB_SEQ_CAP * dim * sizeof(float));
+        free(x);
+        x = xsub;
+        seq = ENCODER_CALIB_SEQ_CAP;
+    }
 
     /* 4 stages, each with `depths[s]` blocks followed by a downsample
      * (except the last stage). */

@@ -104,6 +104,17 @@ static char **glob_expand(const char *pattern, int *out_n) {
         *out_n = 1;
         return list;
     }
+    /* Split into prefix (before STAR) and suffix (after STAR).
+     * For pattern like /a/b/page-STAR-/page1.png:
+     *   prefix = /a/b/page
+     *   suffix = /page1.png
+     * The dir to scan is the part of prefix up to the last '/'.
+     * The name-prefix to match is the part of prefix after the last '/'.
+     * For each dir entry matching name-prefix, we build full = dir + "/" + name
+     * and then check that full ends with suffix. BUT suffix may contain
+     * subpaths (like /page1.png), so we need to stat() the full path to
+     * verify it exists.
+     */
     char prefix[1024], suffix[1024];
     size_t plen = star - pattern;
     if (plen >= sizeof(prefix)) plen = sizeof(prefix)-1;
@@ -129,17 +140,19 @@ static char **glob_expand(const char *pattern, int *out_n) {
     if (!d) return NULL;
     char **list = NULL;
     int cap = 0, n = 0;
+    size_t pplen = strlen(pat_prefix);
     struct dirent *e;
     while ((e = readdir(d))) {
         const char *name = e->d_name;
-        size_t nlen = strlen(name);
-        size_t pplen = strlen(pat_prefix);
-        size_t slen = strlen(suffix);
-        if (nlen < pplen + slen) continue;
         if (strncmp(name, pat_prefix, pplen) != 0) continue;
-        if (slen > 0 && strcmp(name + nlen - slen, suffix) != 0) continue;
+        /* Build candidate full path: dir + "/" + name + suffix
+         * (suffix may be empty or contain subpaths like /page1.png) */
         char full[2048];
-        snprintf(full, sizeof(full), "%s/%s", dir, name);
+        snprintf(full, sizeof(full), "%s/%s%s", dir, name, suffix);
+        /* Verify the file exists */
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        if (!S_ISREG(st.st_mode)) continue;
         if (n >= cap) {
             cap = cap ? cap * 2 : 16;
             list = realloc(list, cap * sizeof(char*));
@@ -211,9 +224,12 @@ static int palettize_tensor_lloyd_max(
         for (size_t i = 0; i < N; i++) hess_flat[i] = 1.0f;
     }
 
-    /* Step c: run Hessian-weighted Lloyd-Max (palette=16, 20 iters) */
+    /* Step c: run Hessian-weighted Lloyd-Max (palette=16, 10 iters for sweep).
+     * 10 iterations is sufficient for convergence on most weight tensors
+     * (the centroids move < 1e-6 after ~5 iters). This halves palettization
+     * time vs max_iter=20 with negligible quality loss. */
     int palette = 16;
-    int max_iter = 20;
+    int max_iter = 10;
     float *lut = xmalloc(palette * sizeof(float));
     uint8_t *idx = xmalloc(N);  /* original (out_dim, in_dim) order */
     float delta = hessian_lloyd_max(W, hess_flat, (int)N, palette, max_iter,

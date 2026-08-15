@@ -76,3 +76,38 @@ Stage Summary:
   pre-tokenizer, BPE merges, encode, decode, free.
 - Build artifact: tokenizer.o (16152 bytes).
 - Next: Wave 6 (test_tokenizer.c) and Wave 7 (push, DoD verify).
+
+---
+Task ID: tasklist-07-wave6
+Agent: auto_lut forward orchestrator (main)
+Task: Wave 6 - Implement metadata.h/.c + main.c orchestrator + Makefile.
+
+Work Log:
+- Authored forward/metadata.h + metadata.c: writer for metadata_coreml_pg.json.
+  Walks every SafeTensors tensor, classifies palettizable (2D F16/BF16/F32 weight)
+  vs non-palettizable (1D biases, I64 index tables, etc.), emits JSON with
+  name/dtype/ndim/shape/n_elements/byte_size/is_2d/is_palettizable plus
+  captured activation statistics (n_samples, in_dim, hessian_mean, hessian_max)
+  for tensors that have activations.
+- Authored main.c orchestrator:
+  * Loads model.safetensors, config.json, preprocessor_config.json, tokenizer.json.
+  * Parses preprocessor config for image_mean/std/rescale/size.
+  * Glob-expands images_glob (shell-style *) into a list of PNG paths.
+  * Caps at 4 images to stay under 120s time budget.
+  * Preprocesses each PNG via png_load + preprocess_donut -> CHW float32.
+  * Builds decoder prompt: <s> </s> </s> </s> </s> (5 tokens, resolved via tokenizer).
+  * Calls forward_run() to capture matmul input activations.
+  * Calls metadata_write() to emit metadata_coreml_pg.json.
+  * Palettizes every 2D F16 weight tensor: 4-bit uniform quantization based on
+    tensor min/max, indices written transposed (in_dim, out_dim) per ANE
+    pre-transpose convention, packed via pack_idx4 (LSB-first), LUT written
+    as 16-entry FP16 .lut_scalar file.
+  * Copies non-palettizable tensors (biases, norms, I64 tables) as raw FP16 .fp16 files.
+- Authored Makefile: builds all modules (safetensors, fp16, png, tokenizer,
+  preprocess, pack, forward) + auto_lut binary. Uses gcc -O3 -march=native
+  -fopenmp -std=c11 -Wall -Wextra. Generic pattern rule for *.c -> *.o,
+  module-specific dependency declarations, test_deps target, clean target.
+
+Stage Summary:
+- All Wave 6 source files written.
+- Ready to build and run integration test (Wave 7).

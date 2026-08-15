@@ -1,0 +1,14 @@
+# Build artifacts
+*.o
+*.obj
+
+# Test binaries (no extension on Linux)
+test_pack
+test_json
+test_safetensors
+
+# Editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store

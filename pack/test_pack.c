@@ -43,7 +43,12 @@ static int g_failures = 0;
 /* can verify roundtrip behaviour.                                           */
 /* ------------------------------------------------------------------------- */
 
-/* Unpack 4-bit indices: byte[k] -> idx[2k] (low), idx[2k+1] (high). */
+/* Unpack 4-bit indices: byte[k] -> idx[2k] (low), idx[2k+1] (high).
+ *
+ * Marked noinline so gcc cannot see the destination buffer size at the
+ * call site — otherwise -Wstringop-overflow issues a false positive when
+ * the destination happens to be a small stack array. */
+__attribute__((noinline))
 static void unpack_idx4(const uint8_t *packed, size_t n_bytes, uint8_t *out)
 {
     for (size_t k = 0; k < n_bytes; k++) {
@@ -54,6 +59,7 @@ static void unpack_idx4(const uint8_t *packed, size_t n_bytes, uint8_t *out)
 
 /* Unpack 6-bit indices: read 6 bits at a time, LSB-first.
  * Reads exactly ceil(n_indices*6/8) bytes from `packed`. */
+__attribute__((noinline))
 static void unpack_idx6(const uint8_t *packed, size_t n_indices, uint8_t *out)
 {
     uint32_t acc  = 0;
@@ -79,7 +85,7 @@ static void test_pack_idx4_known(void)
 {
     uint8_t in[8]   = {0, 1, 2, 3, 4, 5, 6, 7};
     uint8_t out[4];
-    uint8_t back[8];
+    uint8_t back[16];   /* oversized to silence gcc stringop-overflow false positive */
 
     size_t n = pack_idx4(in, 1, 8, out);
     CHECK(n == 4, "pack_idx4 wrote %zu bytes, expected 4", n);
@@ -98,7 +104,7 @@ static void test_pack_idx6_known(void)
 {
     uint8_t in[8]   = {0, 1, 2, 3, 4, 5, 6, 7};
     uint8_t out[6];
-    uint8_t back[8];
+    uint8_t back[16];   /* oversized to silence gcc stringop-overflow false positive */
 
     size_t n = pack_idx6(in, 1, 8, out);
     CHECK(n == 6, "pack_idx6 wrote %zu bytes, expected 6", n);
@@ -160,7 +166,8 @@ static void test_pack_idx6_edge(void)
 {
     /* 0xFF input should be masked to 0x3F. */
     uint8_t in[1] = {0xFF};
-    uint8_t out[1];
+    uint8_t out[2];   /* pack_idx6 may write up to ceil(2*6/8)=1 byte for 1 index,
+                      * but we size for the second sub-test (2 indices). */
     size_t  n = pack_idx6(in, 1, 1, out);
     CHECK(n == 1, "wrote %zu, expected 1", n);
     /* 0x3F in binary is 00111111, packed LSB-first into bit 0 of byte 0. */
@@ -314,9 +321,10 @@ static void test_sanitize_name(void)
     CHECK(strcmp(buf, "model_layers_0_weight") == 0,
           "got '%s', expected 'model_layers_0_weight'", buf);
 
-    /* Slashes and backslashes -> underscores. */
-    /* In C source, "\\\\" is one backslash. */
-    sanitize_name("a/b\\\\c.d", buf, sizeof(buf));
+    /* Slashes and backslashes -> underscores.
+     * In C source, "\\\\" represents one literal backslash, so the
+     * actual input string is "a/b\c.d" (7 chars: a / b \ c . d). */
+    sanitize_name("a/b\\c.d", buf, sizeof(buf));
     CHECK(strcmp(buf, "a_b_c_d") == 0,
           "got '%s', expected 'a_b_c_d'", buf);
 

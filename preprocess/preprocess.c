@@ -183,11 +183,42 @@ static uint8_t *bilinear_resize(const Image *img, int target_w, int target_h) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Forward declarations (implemented in later waves)                   */
+/* Transform: rescale + normalise + transpose + FP16 (Wave 5)          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Convert an interleaved HWC uint8 RGB buffer into a contiguous NCHW
+ * FP16 buffer. For each pixel and channel the transform is:
+ *
+ *   fp16 = (uint8 * rescale_factor - mean[c]) / std[c]
+ *
+ * The HWC->CHW transpose is performed on the fly: the destination is
+ * laid out as [channel][y][x] so dst[c*H*W + y*W + x] holds the value
+ * for channel c at spatial position (y,x). This matches the layout
+ * expected by the downstream inference / palettization stages.
+ *
+ * The loop is written to be auto-vectorisable: the inner x-loop walks
+ * contiguous source memory and writes contiguous destination memory per
+ * channel, so -O3 -march=native can emit AVX2/AVX-512 for the float
+ * arithmetic and the fp32->fp16 conversion.
+ */
 static void transform_to_fp16(const uint8_t *src, int h, int w,
-                              const PreprocessConfig *cfg, uint16_t *dst);
+                              const PreprocessConfig *cfg, uint16_t *dst) {
+    const float rf = cfg->rescale_factor;
+    const size_t plane = (size_t)h * (size_t)w;   /* samples per channel */
+
+    for (int c = 0; c < 3; c++) {
+        float mean = cfg->mean[c];
+        float inv_std = 1.0f / cfg->std[c];
+        uint16_t *out_plane = dst + c * plane;
+        const uint8_t *in = src + c;                /* HWC: channel c */
+        for (size_t i = 0; i < plane; i++) {
+            float v = (float)in[i * 3] * rf;        /* rescale 1/255 */
+            v = (v - mean) * inv_std;               /* normalise */
+            out_plane[i] = fp32_to_fp16(v);         /* cast FP16 */
+        }
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Public API (implemented in Wave 6)                                  */

@@ -1,42 +1,85 @@
 #ifndef TOKENIZER_H
 #define TOKENIZER_H
 
-#include <stddef.h>
-
-/* ===========================================================================
- * tokenizer.h — Minimal HuggingFace tokenizer loader for auto_lut.
+/*
+ * tokenizer.h - BPE Tokenizer for the auto_lut project
  *
- * Loads a HF tokenizer.json and exposes only what the forward-pass driver
- * needs: encode a string into a list of input_ids using the "added_tokens"
- * list (special tokens) and a basic BPE/WordPiece fallback that maps
- * characters to their unicode codepoint id (used only for the prompt
- * "<s>" -> [0] for the Dolphin decoder prefill).
+ * Loads a HuggingFace `tokenizer.json` (BPE model with ByteLevel
+ * pre-tokenizer and decoder) and exposes encode/decode in pure C.
  *
- * This is NOT a full BPE implementation. The auto_lut forward pass needs
- * only the fixed 5-token Dolphin prompt: "<s>", "<s_docvqa>", "<question>",
- * "<answer>", "</s>" — all of which appear in added_tokens with explicit
- * ids. The driver constructs the prompt directly; this module exists to
- * look up token ids by content for any future prompt variants.
- * =========================================================================== */
+ * Design notes:
+ *   - Depends only on the in-tree json.h/json.c parser.
+ *   - No external libraries; C11 only.
+ *   - Special tokens (added_tokens) are matched greedily by longest
+ *     content string before BPE pre-tokenization runs.
+ *   - ByteLevel pre-tokenization follows the GPT-2 recipe: regex
+ *     split + byte-to-unicode map (so a leading space becomes U+0120 'Ġ').
+ *   - BPE merges are applied greedily by lowest rank.
+ *   - The HuggingFace post-processor (template wrapping with <s>/</s>)
+ *     is NOT applied; callers that need wrapping must add it themselves.
+ *     This matches the Dolphin tokenizer test expectation that the
+ *     input text is encoded verbatim without synthetic bos/eos injection.
+ *
+ * Memory model:
+ *   - The returned int array from tokenizer_encode() is malloc'd and
+ *     owned by the caller; free with free().
+ *   - The returned char* from tokenizer_decode() is malloc'd and owned
+ *     by the caller; free with free().
+ *   - Tokenizer itself is an opaque pointer; free with tokenizer_free().
+ */
 
-typedef struct {
-    int    id;
-    char  *content;   /* owned, NUL-terminated */
-} AddedToken;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-typedef struct {
-    AddedToken *tokens;
-    int         count;
-    int         cap;
-} Tokenizer;
+typedef struct Tokenizer Tokenizer;
 
-/* Load tokenizer.json. Returns NULL on error. */
+/*
+ * Load a HuggingFace tokenizer.json file.
+ *
+ * Returns NULL on failure (file not found, parse error, OOM).
+ * The returned Tokenizer must be freed with tokenizer_free().
+ */
 Tokenizer *tokenizer_load(const char *path);
 
-/* Look up a token by its exact content string. Returns id or -1. */
-int tokenizer_lookup(const Tokenizer *tk, const char *content);
+/*
+ * Encode a NUL-terminated UTF-8 string into a sequence of token IDs.
+ *
+ * - Special tokens embedded in `text` (e.g. "<s>", " <Answer/>") are
+ *   matched directly against the tokenizer's added_tokens list and
+ *   emitted as their registered IDs (NOT split into BPE pieces).
+ * - All other text is split by the ByteLevel pre-tokenizer and then
+ *   BPE-merged.
+ *
+ * On success, returns a malloc'd int array of length *out_len.
+ * The caller owns the array and must free() it.
+ *
+ * On failure, returns NULL and sets *out_len = 0.
+ */
+int *tokenizer_encode(Tokenizer *tok, const char *text, int *out_len);
 
-/* Free. Safe on NULL. */
-void tokenizer_free(Tokenizer *tk);
+/*
+ * Decode a sequence of token IDs back to a NUL-terminated UTF-8 string.
+ *
+ * - Applies the ByteLevel decoder: each token's vocab string is
+ *   converted from byte-level unicode (e.g. 'Ġ' -> space) back to
+ *   raw bytes, then concatenated.
+ * - Special tokens are emitted literally (their content strings are
+ *   already in their final form, e.g. " <Answer/>").
+ *
+ * On success, returns a malloc'd char* the caller must free().
+ * On failure, returns NULL.
+ */
+char *tokenizer_decode(Tokenizer *tok, const int *ids, int len);
+
+/*
+ * Free a Tokenizer previously returned by tokenizer_load().
+ * Safe to call on NULL.
+ */
+void tokenizer_free(Tokenizer *tok);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* TOKENIZER_H */

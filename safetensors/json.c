@@ -360,8 +360,10 @@ const JsonValue *json_array_get(const JsonValue *v, size_t index)
 
 long json_as_long(const JsonValue *v)
 {
-    if (!v || v->type != JSON_NUMBER) return 0;
-    return (long)v->v.number;
+    if (!v) return 0;
+    if (v->type == JSON_NUMBER) return (long)v->v.number;
+    if (v->type == JSON_BOOL)  return v->v.boolean ? 1L : 0L;
+    return 0;
 }
 
 int json_as_string(const JsonValue *v, char *out, size_t cap)

@@ -221,8 +221,58 @@ static void transform_to_fp16(const uint8_t *src, int h, int w,
 }
 
 /* ------------------------------------------------------------------ */
-/* Public API (implemented in Wave 6)                                  */
+/* Public API (Wave 6)                                                 */
 /* ------------------------------------------------------------------ */
 
-PixelValues *preprocess_image(Image *img, const char *preprocessor_config_path);
-void pixel_values_free(PixelValues *pv);
+/*
+ * Run the full preprocessing pipeline on a decoded Image:
+ *
+ *   1. Parse the preprocessor config (size / mean / std / rescale).
+ *   2. Bilinearly resize to (target_w, target_h).
+ *   3. Rescale by 1/255, normalise per channel, transpose HWC->CHW,
+ *      and cast to FP16.
+ *
+ * The returned PixelValues owns a single contiguous FP16 buffer of
+ * shape (1, 3, target_h, target_w). Returns NULL on any failure
+ * (bad config, OOM, NULL input image). The caller must release the
+ * result with pixel_values_free().
+ */
+PixelValues *preprocess_image(Image *img, const char *preprocessor_config_path) {
+    if (!img || !img->data || !preprocessor_config_path) return NULL;
+
+    PreprocessConfig cfg;
+    if (parse_config(preprocessor_config_path, &cfg) != 0) return NULL;
+    if (cfg.target_w <= 0 || cfg.target_h <= 0) return NULL;
+
+    /* Resize: if the source is already the target size we still run the
+     * resize pass (it is a cheap identity copy) so the output buffer is
+     * always a fresh, owned, 3-channel HWC buffer. */
+    uint8_t *resized = bilinear_resize(img, cfg.target_w, cfg.target_h);
+    if (!resized) return NULL;
+
+    PixelValues *pv = (PixelValues *)malloc(sizeof(PixelValues));
+    if (!pv) { free(resized); return NULL; }
+    pv->batch    = 1;
+    pv->channels = 3;
+    pv->height   = cfg.target_h;
+    pv->width    = cfg.target_w;
+
+    size_t n = (size_t)pv->batch * pv->channels * pv->height * pv->width;
+    pv->data = (uint16_t *)malloc(n * sizeof(uint16_t));
+    if (!pv->data) { free(resized); free(pv); return NULL; }
+
+    transform_to_fp16(resized, cfg.target_h, cfg.target_w, &cfg, pv->data);
+
+    free(resized);
+    return pv;
+}
+
+/*
+ * Release a PixelValues previously returned by preprocess_image().
+ * NULL-tolerant: calling on NULL is a no-op.
+ */
+void pixel_values_free(PixelValues *pv) {
+    if (!pv) return;
+    free(pv->data);
+    free(pv);
+}

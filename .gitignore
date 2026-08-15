@@ -1,8 +1,5 @@
 *.o
-*.a
-*.so
-test_*
-*.exe
-.DS_Store
-*~
-
+auto_lut
+test_deps
+test_fp16_debug
+palettized_out/

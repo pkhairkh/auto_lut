@@ -51,6 +51,15 @@ static JsonValue *new_value(JsonType t)
     return v;
 }
 
+static char *strndup_raw(const char *src, size_t n)
+{
+    char *p = (char *)malloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, src, n);
+    p[n] = '\0';
+    return p;
+}
+
 /* Decode a JSON string literal beginning at *s->p == '"'. Returns a
  * malloc'd NUL-terminated string, or NULL on error. Advances s->p
  * past the closing quote. */

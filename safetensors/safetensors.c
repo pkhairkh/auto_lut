@@ -235,8 +235,6 @@ SafeTensors *safetensors_load(const char *path)
             json_free(root);
             return NULL;
         }
-        /* set name AFTER fill_tensor_info, because fill_tensor_info
-         * memsets the struct (which would otherwise clobber the name). */
         set_tensor_name(ti, key);
         /* Bounds-check the tensor's bytes against the mapping. */
         if (ti->byte_offset + ti->byte_size > file_size) {

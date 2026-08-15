@@ -1,0 +1,4 @@
+*.o
+test_deps
+test_fp16_debug
+test_forward

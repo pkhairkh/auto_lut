@@ -111,10 +111,81 @@ static int parse_config(const char *path, PreprocessConfig *cfg) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Bilinear resize (Wave 4)                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Bilinearly resize an interleaved HWC uint8 RGB image to
+ * (target_w, target_h). Uses the half-pixel-center coordinate mapping
+ * that matches PIL/HuggingFace resample=BILINEAR (resample=2):
+ *
+ *   src = (dst + 0.5) * (src_size / dst_size) - 0.5
+ *
+ * Coordinates are clamped to the valid source range so borders never
+ * read out of bounds. Returns a malloc'd buffer of
+ * target_w*target_h*3 bytes (always 3 channels) or NULL on OOM.
+ */
+static uint8_t *bilinear_resize(const Image *img, int target_w, int target_h) {
+    int src_w = img->width;
+    int src_h = img->height;
+    int src_c = img->channels;
+    if (src_c < 3) src_c = 3;                 /* promote grayscale by replication */
+
+    uint8_t *out = (uint8_t *)malloc((size_t)target_w * target_h * 3);
+    if (!out) return NULL;
+
+    const float sx_ratio = (float)src_w / (float)target_w;
+    const float sy_ratio = (float)src_h / (float)target_h;
+
+    for (int dy = 0; dy < target_h; dy++) {
+        float sy = ((float)dy + 0.5f) * sy_ratio - 0.5f;
+        int   y0 = (int)floorf(sy);
+        int   y1 = y0 + 1;
+        float fy = sy - (float)y0;
+        if (y0 < 0) { y0 = 0; fy = 0.0f; }
+        if (y1 < 0) y1 = 0;
+        if (y0 > src_h - 1) { y0 = src_h - 1; fy = 0.0f; }
+        if (y1 > src_h - 1) y1 = src_h - 1;
+
+        for (int dx = 0; dx < target_w; dx++) {
+            float sx = ((float)dx + 0.5f) * sx_ratio - 0.5f;
+            int   x0 = (int)floorf(sx);
+            int   x1 = x0 + 1;
+            float fx = sx - (float)x0;
+            if (x0 < 0) { x0 = 0; fx = 0.0f; }
+            if (x1 < 0) x1 = 0;
+            if (x0 > src_w - 1) { x0 = src_w - 1; fx = 0.0f; }
+            if (x1 > src_w - 1) x1 = src_w - 1;
+
+            const uint8_t *p00 = img->data + ((size_t)y0 * src_w + x0) * img->channels;
+            const uint8_t *p01 = img->data + ((size_t)y0 * src_w + x1) * img->channels;
+            const uint8_t *p10 = img->data + ((size_t)y1 * src_w + x0) * img->channels;
+            const uint8_t *p11 = img->data + ((size_t)y1 * src_w + x1) * img->channels;
+            uint8_t *o = out + ((size_t)dy * target_w + dx) * 3;
+
+            for (int c = 0; c < 3; c++) {
+                float v00 = (float)p00[c];
+                float v01 = (float)p01[c];
+                float v10 = (float)p10[c];
+                float v11 = (float)p11[c];
+                /* Bilinear: top row, bottom row, then vertical blend. */
+                float top  = v00 + (v01 - v00) * fx;
+                float bot  = v10 + (v11 - v10) * fx;
+                float val  = top + (bot - top) * fy;
+                int   ival = (int)(val + 0.5f);
+                if (ival < 0)   ival = 0;
+                if (ival > 255) ival = 255;
+                o[c] = (uint8_t)ival;
+            }
+        }
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* Forward declarations (implemented in later waves)                   */
 /* ------------------------------------------------------------------ */
 
-static uint8_t *bilinear_resize(const Image *img, int target_w, int target_h);
 static void transform_to_fp16(const uint8_t *src, int h, int w,
                               const PreprocessConfig *cfg, uint16_t *dst);
 

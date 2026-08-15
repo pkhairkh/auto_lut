@@ -641,10 +641,36 @@ static int load_merges(Tokenizer *t, JsonValue *merges_arr) {
         return -1;
     for (int i = 0; i < n; i++) {
         JsonValue *m = merges_arr->arr[i];
-        if (!m || m->type != JSON_STR) continue;
-        /* Each merge is "tokA tokB" - store as-is with rank = i (lower first). */
-        size_t mlen = strlen(m->str);
-        if (hashmap_put(&t->merges, m->str, mlen, (int)i) != 0) return -1;
+        if (!m) continue;
+        /* HuggingFace tokenizer.json stores merges in two possible
+         * formats: as a single "tokA tokB" string, OR as a 2-element
+         * ["tokA", "tokB"] array. Handle both. */
+        char keybuf[512];
+        size_t keylen = 0;
+        if (m->type == JSON_STR) {
+            /* "tokA tokB" string form */
+            size_t mlen = strlen(m->str);
+            if (mlen >= sizeof(keybuf)) mlen = sizeof(keybuf) - 1;
+            memcpy(keybuf, m->str, mlen);
+            keylen = mlen;
+        } else if (m->type == JSON_ARR && m->arr_len == 2) {
+            JsonValue *a = m->arr[0];
+            JsonValue *b = m->arr[1];
+            if (!a || !b || a->type != JSON_STR || b->type != JSON_STR) continue;
+            size_t la = strlen(a->str);
+            size_t lb = strlen(b->str);
+            if (la + 1 + lb >= sizeof(keybuf)) {
+                /* too long; skip rather than overflow */
+                continue;
+            }
+            memcpy(keybuf, a->str, la);
+            keybuf[la] = ' ';
+            memcpy(keybuf + la + 1, b->str, lb);
+            keylen = la + 1 + lb;
+        } else {
+            continue;
+        }
+        if (hashmap_put(&t->merges, keybuf, keylen, i) != 0) return -1;
     }
     t->merge_count = n;
     return 0;
@@ -779,6 +805,10 @@ static int match_special_at(Tokenizer *t, const char *text, size_t len, size_t p
     for (size_t i = 0; i < t->special_count; i++) {
         const char *s = t->special_str[i];
         size_t sl = strlen(s);
+        /* Skip 0-length specials (their content contains a NUL byte that
+         * we cannot represent as a C string; treat them as unmatchable
+         * from text). */
+        if (sl == 0) continue;
         if (pos + sl > len) continue;
         if (memcmp(text + pos, s, sl) == 0) return (int)i;
     }
@@ -841,7 +871,11 @@ int *tokenizer_encode(Tokenizer *tok, const char *text, int *out_len) {
                 ids = ni; cap_ids = new_cap;
             }
             ids[n_ids++] = tok->special_id[sp_idx];
-            i += strlen(tok->special_str[sp_idx]);
+            size_t sp_len = strlen(tok->special_str[sp_idx]);
+            /* Safety: a matched special must have positive length (we
+             * already skip 0-length ones in match_special_at). If somehow
+             * length is 0, advance by 1 to avoid an infinite loop. */
+            i += sp_len > 0 ? sp_len : 1;
             continue;
         }
         if (!in_seg) { seg_start = i; in_seg = 1; }
@@ -899,9 +933,33 @@ static char *bytestr_to_bytes(const char *s) {
     return out;
 }
 
+/* Linear lookup: is `id` one of the special-token ids? Used by decode
+ * to skip byte-level decoding on special tokens (their content is the
+ * final text form, e.g. " <Answer/>"). */
+static int is_special_lookup(Tokenizer *tok, int id) {
+    for (size_t i = 0; i < tok->special_count; i++) {
+        if (tok->special_id[i] == id) return 1;
+    }
+    return 0;
+}
+
 char *tokenizer_decode(Tokenizer *tok, const int *ids, int len) {
     if (!tok || (!ids && len > 0)) return NULL;
-    /* Compute total length first to allocate a single buffer. */
+
+    /* Build a set of special-token ids for fast lookup, so we can
+     * skip byte-level decoding on them (special tokens are already
+     * in their final text form, e.g. " <Answer/>"). */
+    /* Linear scan is fine for typical decode sizes (a few hundred ids).
+     * For very large decodes a hash set would be better, but this is
+     * not the hot path. */
+    #define IS_SPECIAL(id) is_special_lookup(tok, (id))
+
+    /* First pass: compute output length.
+     * For non-special tokens, the decoded byte count equals the UTF-8 byte
+     * count of the vocab string (each byte-level code point decodes to
+     * exactly one byte). For special tokens, the decoded byte count is
+     * just strlen(content). Both reduce to strlen(vocab_str), so we can
+     * sum strlen(rev_vocab[id]) directly. */
     size_t total = 1;  /* NUL */
     for (int i = 0; i < len; i++) {
         if (ids[i] < 0 || (size_t)ids[i] >= tok->rev_cap) continue;
@@ -915,16 +973,25 @@ char *tokenizer_decode(Tokenizer *tok, const int *ids, int len) {
         if (ids[i] < 0 || (size_t)ids[i] >= tok->rev_cap) continue;
         const char *s = tok->rev_vocab[ids[i]];
         if (!s) continue;
-        size_t sl = strlen(s);
-        memcpy(out + pos, s, sl);
-        pos += sl;
+        if (IS_SPECIAL(ids[i])) {
+            /* Special token: emit content verbatim (no byte-level decode). */
+            size_t sl = strlen(s);
+            memcpy(out + pos, s, sl);
+            pos += sl;
+        } else {
+            /* Regular token: reverse byte-level encoding. */
+            char *dec = bytestr_to_bytes(s);
+            if (dec) {
+                size_t dl = strlen(dec);
+                memcpy(out + pos, dec, dl);
+                pos += dl;
+                free(dec);
+            }
+        }
     }
     out[pos] = '\0';
-
-    /* Reverse byte-level encoding on the concatenated string. */
-    char *rev = bytestr_to_bytes(out);
-    free(out);
-    return rev;
+    #undef IS_SPECIAL
+    return out;
 }
 
 /* ------------------------------------------------------------------ */

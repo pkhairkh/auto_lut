@@ -1,0 +1,7 @@
+# Build artifacts
+*.o
+test_tokenizer
+test_*
+
+# Local json dependency (copied from /root/auto_lut_json/json/ at build time)
+# We DO commit it for reproducibility within this worktree.

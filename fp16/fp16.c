@@ -180,3 +180,15 @@ void fp16_to_fp32_array(const uint16_t *src, float *dst, size_t n) {
         dst[i] = fp16_to_fp32_scalar(src[i]);
     }
 }
+
+/* ===========================================================================
+ * fp32_to_fp16_array
+ *
+ * Round `n` binary32 values to binary16 (round-to-nearest-even). Caller must
+ * ensure `src` and `dst` do not overlap.
+ * =========================================================================== */
+void fp32_to_fp16_array(const float *src, uint16_t *dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = fp32_to_fp16_scalar(src[i]);
+    }
+}

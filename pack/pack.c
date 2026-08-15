@@ -92,3 +92,24 @@ size_t pack_idx6(const uint8_t *indices, int rows, int cols, uint8_t *out)
 
     return k;
 }
+
+/* -------------------------------------------------------------------------
+ * pack_idx8 — 8-bit packing (raw bytes).
+ *
+ * No bit manipulation is required: each index already occupies a full
+ * byte. The implementation is a straight memcpy, but we keep it as a
+ * real function rather than a macro so the public API is symmetric and
+ * so that any future ANE-specific byte ordering (e.g. byte swapping on
+ * big-endian hosts, although we only target x86-64) can be centralised
+ * here.
+ *
+ * Output size: rows * cols bytes.
+ * ------------------------------------------------------------------------- */
+size_t pack_idx8(const uint8_t *indices, int rows, int cols, uint8_t *out)
+{
+    size_t n = (size_t)rows * (size_t)cols;
+    if (n > 0) {
+        memcpy(out, indices, n);
+    }
+    return n;
+}

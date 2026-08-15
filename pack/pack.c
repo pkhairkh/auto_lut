@@ -296,3 +296,59 @@ void write_lut_fp16(const float *lut, int groups, int palette,
     fclose(f);
     free(buf);
 }
+
+/* -------------------------------------------------------------------------
+ * copy_tensor_fp16 — copy a non-palettisable tensor to a file as FP16.
+ *
+ * If `is_fp32` is non-zero, every 32-bit float in `data` is converted to
+ * IEEE 754 binary16 via pack_f32_to_f16 (with correct rounding) and
+ * written little-endian. If `is_fp32` is zero the input is assumed to
+ * already be little-endian FP16 (the safetensors convention) and is
+ * copied verbatim — no endianness swap, no validation.
+ *
+ * The output file is exactly `n_elements * 2` bytes long. Like
+ * write_lut_fp16, this function returns void and silently no-ops on
+ * failure (NULL inputs, zero elements, malloc failure, file open
+ * failure).
+ * ------------------------------------------------------------------------- */
+void copy_tensor_fp16(const void *data, size_t n_elements, int is_fp32,
+                      const char *path)
+{
+    if (data == NULL || path == NULL || n_elements == 0) {
+        return;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        return;
+    }
+
+    if (!is_fp32) {
+        /* Already FP16, little-endian (safetensors convention). Just copy
+         * the bytes straight through. */
+        const uint8_t *src = (const uint8_t *)data;
+        size_t bytes = n_elements * 2u;
+        size_t written = fwrite(src, 1, bytes, f);
+        (void)written;
+        fclose(f);
+        return;
+    }
+
+    /* FP32 input — convert element-by-element. */
+    const float *src = (const float *)data;
+    uint16_t *buf = (uint16_t *)malloc(n_elements * sizeof(uint16_t));
+    if (buf == NULL) {
+        fclose(f);
+        return;
+    }
+
+    for (size_t i = 0; i < n_elements; i++) {
+        buf[i] = pack_f32_to_f16(src[i]);
+    }
+
+    size_t written = fwrite(buf, sizeof(uint16_t), n_elements, f);
+    (void)written;
+
+    free(buf);
+    fclose(f);
+}

@@ -163,3 +163,20 @@ uint16_t fp32_to_fp16_scalar(float f) {
     }
     return (uint16_t)(sign | ((uint32_t)e16 << 10) | (result_m & 0x03FFu));
 }
+
+/* ===========================================================================
+ * fp16_to_fp32_array
+ *
+ * Expand `n` binary16 values into binary32. Each element is an exact
+ * expansion (see fp16_to_fp32_scalar), so the array form is just a tight
+ * loop. Caller must ensure `src` and `dst` do not overlap.
+ *
+ * Performance note: kept as a plain scalar loop for portability and clarity.
+ * The auto_lut engine will plug an AVX2/AVX-512 + OpenMP vectorised version
+ * on top of this reference path; this function is the correctness oracle.
+ * =========================================================================== */
+void fp16_to_fp32_array(const uint16_t *src, float *dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        dst[i] = fp16_to_fp32_scalar(src[i]);
+    }
+}

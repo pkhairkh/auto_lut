@@ -623,8 +623,8 @@ static int load_vocab(Tokenizer *t, JsonValue *vocab_obj) {
     if (hashmap_init(&t->vocab, n > (int)HASH_INIT_CAP ? (size_t)n : HASH_INIT_CAP) != 0)
         return -1;
     for (int i = 0; i < n; i++) {
-        const char *k  = vocab_obj->keys[i];
-        JsonValue   *vv = vocab_obj->vals[i];
+        const char *k  = json_obj_key_at(vocab_obj, i);
+        JsonValue   *vv = json_obj_val_at(vocab_obj, i);
         if (!vv || vv->type != JSON_NUM) continue;
         int id = (int)vv->num;
         size_t klen = strlen(k);

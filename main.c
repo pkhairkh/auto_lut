@@ -9,20 +9,24 @@
  *   2. Glob-expand <images_glob> (shell-style *) to a list of PNG paths
  *   3. For each image: png_load + preprocess_donut -> CHW float32 pixel_values
  *   4. Run forward_run() over all images + a fixed Dolphin prompt
- *      (<s> <s_docvqa> </s> </s> </s>) to capture matmul input activations
+ *      (<s> </s> </s> </s> </s>) to capture matmul input activations
  *   5. Write metadata_coreml_pg.json (per-tensor manifest)
- *   6. For each 2D F16 tensor: write a palettized .idx + .lut_scalar file
- *      (uniform 4-bit palettization based on tensor min/max — this is a
- *       simplified palettizer sufficient to meet the DoD; the real
- *       Hessian-weighted Lloyd-Max palettizer lives in lloyd_max/ and
- *       can be swapped in later)
+ *   6. For each 2D F16 weight tensor: run the REAL Hessian-weighted
+ *      Lloyd-Max palettizer:
+ *        a. clip_outliers() per output channel (99.95th percentile)
+ *        b. Build per-element Hessian from captured activations
+ *           (broadcast per-input-channel Hessian across all output rows)
+ *        c. hessian_lloyd_max() with palette=16, max_iter=20
+ *        d. Transpose idx to (in_dim, out_dim) per ANE pre-transpose convention
+ *        e. Pack via pack_idx4 (LSB-first)
+ *        f. Write .idx (header + packed indices) and .lut_scalar (16 FP16)
  *   7. For each non-palettizable tensor: write .fp16 file verbatim
  *
  * Output layout under <output_dir>/:
  *   metadata_coreml_pg.json
  *   activations/<sanitized_name>.bin  (per-tensor activation capture)
  *   activations/manifest.json
- *   palettized/<sanitized_name>.idx       (uint8 indices, transposed)
+ *   palettized/<sanitized_name>.idx       (packed uint8 indices, transposed)
  *   palettized/<sanitized_name>.lut_scalar (FP16 LUT, 16 entries)
  *   palettized/<sanitized_name>.fp16       (non-palettizable tensors, raw FP16)
  */
@@ -35,6 +39,9 @@
 #include "forward.h"
 #include "metadata.h"
 #include "pack.h"
+#include "lloyd_max.h"
+#include "percentile.h"
+#include "cosine.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +52,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <time.h>
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+/* C11: strdup is POSIX, not ISO C — declare it ourselves */
+extern char *strdup(const char *);
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -87,20 +99,17 @@ static char **glob_expand(const char *pattern, int *out_n) {
     *out_n = 0;
     const char *star = strchr(pattern, '*');
     if (!star) {
-        /* no glob — single file */
         char **list = xmalloc(sizeof(char*));
         list[0] = strdup(pattern);
         *out_n = 1;
         return list;
     }
-    /* split into [prefix][suffix] */
     char prefix[1024], suffix[1024];
     size_t plen = star - pattern;
     if (plen >= sizeof(prefix)) plen = sizeof(prefix)-1;
     memcpy(prefix, pattern, plen); prefix[plen] = 0;
     strncpy(suffix, star + 1, sizeof(suffix)-1); suffix[sizeof(suffix)-1] = 0;
 
-    /* find the last '/' in prefix — that's the directory */
     char *last_slash = strrchr(prefix, '/');
     char dir[1024] = ".";
     char pat_prefix[1024] = "";
@@ -108,7 +117,6 @@ static char **glob_expand(const char *pattern, int *out_n) {
         size_t dlen = last_slash - prefix + 1;
         if (dlen >= sizeof(dir)) dlen = sizeof(dir)-1;
         memcpy(dir, prefix, dlen); dir[dlen] = 0;
-        /* remove trailing slash from dir for opendir, but keep for matching */
         if (dlen > 0 && dir[dlen-1] == '/') dir[dlen-1] = 0;
         strncpy(pat_prefix, last_slash + 1, sizeof(pat_prefix)-1);
         pat_prefix[sizeof(pat_prefix)-1] = 0;
@@ -124,14 +132,12 @@ static char **glob_expand(const char *pattern, int *out_n) {
     struct dirent *e;
     while ((e = readdir(d))) {
         const char *name = e->d_name;
-        /* match pat_prefix as a prefix and suffix as a suffix */
         size_t nlen = strlen(name);
         size_t pplen = strlen(pat_prefix);
         size_t slen = strlen(suffix);
         if (nlen < pplen + slen) continue;
         if (strncmp(name, pat_prefix, pplen) != 0) continue;
         if (slen > 0 && strcmp(name + nlen - slen, suffix) != 0) continue;
-        /* build full path: dir + "/" + name */
         char full[2048];
         snprintf(full, sizeof(full), "%s/%s", dir, name);
         if (n >= cap) {
@@ -143,7 +149,6 @@ static char **glob_expand(const char *pattern, int *out_n) {
     }
     closedir(d);
     *out_n = n;
-    /* sort for determinism */
     for (int i = 0; i < n; i++) {
         for (int j = i+1; j < n; j++) {
             if (strcmp(list[i], list[j]) > 0) {
@@ -155,71 +160,103 @@ static char **glob_expand(const char *pattern, int *out_n) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Simplified palettizer: 4-bit uniform quantization.                 */
+/* Real Hessian-weighted Lloyd-Max palettization for a 2D weight.     */
 /* ------------------------------------------------------------------ */
 
-/* Quantize a 2D weight tensor (out_dim, in_dim) row-major float32 to
- * 4-bit indices + 16-entry LUT. The LUT is computed as 16 uniformly-spaced
- * values between min and max of the tensor. Indices are written transposed
- * (in_dim, out_dim) per the ANE pre-transpose convention. */
-static int palettize_tensor_4bit(
-    const float *W, int out_dim, int in_dim,
+/* Palettize a 2D weight tensor (out_dim, in_dim) row-major float32 using
+ * the real Hessian-weighted Lloyd-Max quantizer.
+ *
+ *   W            : (out_dim, in_dim) row-major float32 weights (modified
+ *                  in place by clip_outliers)
+ *   hessian_per_in: (in_dim,) per-input-channel Hessian diagonal captured
+ *                  during forward pass. May be NULL (falls back to
+ *                  uniform weighting = hessian[i] = 1).
+ *   out_dim, in_dim
+ *   out_dir      : directory to write .idx and .lut_scalar files
+ *   tensor_name  : weight tensor name (for filename + logging)
+ *
+ * Writes:
+ *   <out_dir>/<sanitized>.idx        header(4 int32) + packed uint8 indices
+ *   <out_dir>/<sanitized>.lut_scalar 16 FP16 centroids
+ *
+ * Returns 0 on success, -1 on failure. */
+static int palettize_tensor_lloyd_max(
+    float *W, const float *hessian_per_in,
+    int out_dim, int in_dim,
     const char *out_dir, const char *tensor_name
 ) {
     char sanitized[1024];
     sanitize_for_file(tensor_name, sanitized, sizeof(sanitized));
 
-    /* find min/max */
-    float wmin = 1e30f, wmax = -1e30f;
-    size_t n = (size_t)out_dim * in_dim;
-    for (size_t i = 0; i < n; i++) {
-        if (W[i] < wmin) wmin = W[i];
-        if (W[i] > wmax) wmax = W[i];
-    }
-    if (wmax <= wmin) { wmax = wmin + 1e-6f; }
+    /* Step a: clip outliers per output channel (99.95th percentile) */
+    clip_outliers(W, out_dim, in_dim);
 
-    /* build 16-entry LUT (uniform) */
-    float lut[16];
-    for (int k = 0; k < 16; k++) {
-        lut[k] = wmin + (wmax - wmin) * (k / 15.0f);
+    /* Step b: build per-element Hessian (out_dim * in_dim).
+     * The captured Hessian is per input-channel (in_dim,). For element
+     * W[o, j] the weight is hessian_per_in[j] — broadcast across rows.
+     * This is the standard Fisher-diagonal approximation: the error
+     * contribution of W[o, j] is weighted by the squared magnitude of
+     * the activations that flow through it, which is exactly the
+     * per-channel Hessian we accumulated during forward pass. */
+    size_t N = (size_t)out_dim * in_dim;
+    float *hess_flat = xmalloc(N * sizeof(float));
+    if (hessian_per_in) {
+        for (int o = 0; o < out_dim; o++) {
+            const float *src = hessian_per_in;
+            float *dst = hess_flat + (size_t)o * in_dim;
+            memcpy(dst, src, in_dim * sizeof(float));
+        }
+    } else {
+        /* uniform weighting if no activation was captured */
+        for (size_t i = 0; i < N; i++) hess_flat[i] = 1.0f;
     }
 
-    /* compute indices (transposed: indices[j, i] = argmin_k |W[i, j] - lut[k]|) */
-    uint8_t *idx_t = xmalloc((size_t)in_dim * out_dim);  /* (in_dim, out_dim) */
-    float scale = 15.0f / (wmax - wmin);
+    /* Step c: run Hessian-weighted Lloyd-Max (palette=16, 20 iters) */
+    int palette = 16;
+    int max_iter = 20;
+    float *lut = xmalloc(palette * sizeof(float));
+    uint8_t *idx = xmalloc(N);  /* original (out_dim, in_dim) order */
+    float delta = hessian_lloyd_max(W, hess_flat, (int)N, palette, max_iter,
+                                     lut, idx);
+    if (delta < 0.0f) {
+        fprintf(stderr, "  [palettize] lloyd_max FAILED for %s\n", tensor_name);
+        free(hess_flat); free(lut); free(idx);
+        return -1;
+    }
+
+    /* Step d: transpose idx to (in_dim, out_dim) per ANE pre-transpose
+     * convention. idx_t[j, o] = idx[o, j]. */
+    uint8_t *idx_t = xmalloc(N);
     #pragma omp parallel for collapse(2)
     for (int j = 0; j < in_dim; j++) {
-        for (int i = 0; i < out_dim; i++) {
-            float v = W[(size_t)i * in_dim + j];
-            int k = (int)floorf((v - wmin) * scale + 0.5f);
-            if (k < 0) k = 0;
-            if (k > 15) k = 15;
-            idx_t[(size_t)j * out_dim + i] = (uint8_t)k;
+        for (int o = 0; o < out_dim; o++) {
+            idx_t[(size_t)j * out_dim + o] = idx[(size_t)o * in_dim + j];
         }
     }
 
-    /* pack indices with pack_idx4 (LSB-first) */
-    size_t idx_bytes_max = ((size_t)in_dim * out_dim + 1) / 2;
-    uint8_t *packed = xmalloc(idx_bytes_max);
+    /* Step e: pack via pack_idx4 (LSB-first, 2 indices per byte) */
+    size_t packed_max = (N + 1) / 2;
+    uint8_t *packed = xmalloc(packed_max);
     size_t nb = pack_idx4(idx_t, in_dim, out_dim, packed);
 
-    /* write .idx file */
+    /* Step f: write .idx file (header + packed bytes) */
     char path[2048];
     snprintf(path, sizeof(path), "%s/%s.idx", out_dir, sanitized);
     FILE *f = fopen(path, "wb");
-    if (!f) { free(idx_t); free(packed); return -1; }
-    /* header: out_dim, in_dim, n_bits, lut_size */
-    int32_t hdr[4] = { out_dim, in_dim, 4, 16 };
+    if (!f) {
+        free(hess_flat); free(lut); free(idx); free(idx_t); free(packed);
+        return -1;
+    }
+    int32_t hdr[4] = { out_dim, in_dim, 4 /*n_bits*/, palette };
     fwrite(hdr, sizeof(int32_t), 4, f);
     fwrite(packed, 1, nb, f);
     fclose(f);
 
-    /* write .lut_scalar file (16 FP16 values) */
+    /* write .lut_scalar (16 FP16 centroids, little-endian) */
     snprintf(path, sizeof(path), "%s/%s.lut_scalar", out_dir, sanitized);
-    write_lut_fp16(lut, 1, 16, path);
+    write_lut_fp16(lut, 1, palette, path);
 
-    free(idx_t);
-    free(packed);
+    free(hess_flat); free(lut); free(idx); free(idx_t); free(packed);
     return 0;
 }
 
@@ -234,6 +271,18 @@ static int write_nonpalettizable(
     snprintf(path, sizeof(path), "%s/%s.fp16", out_dir, sanitized);
     copy_tensor_fp16(raw_data, n_elements, !is_fp16, path);
     return 0;
+}
+
+/* Find the captured Hessian for a given weight tensor name.
+ * Returns NULL if no activation was captured for this tensor. */
+static const float *find_hessian(const ActivationCapture *ac, const char *name) {
+    if (!ac) return NULL;
+    for (int i = 0; i < ac->n_acts; i++) {
+        if (strncmp(ac->acts[i].name, name, 512) == 0) {
+            return ac->acts[i].hessian;
+        }
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -274,7 +323,7 @@ int main(int argc, char **argv) {
     free(cbuf);
     if (!cfg) { fprintf(stderr, "[main] FAILED to parse config.json\n"); return 1; }
 
-    /* load preprocessor config to get image size + mean/std */
+    /* load preprocessor config */
     snprintf(path, sizeof(path), "%s/preprocessor_config.json", model_dir);
     FILE *pf = fopen(path, "rb");
     float img_mean[3] = {0.485f, 0.456f, 0.406f};
@@ -309,10 +358,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* load tokenizer for special tokens */
+    /* load tokenizer (parallel agent's full BPE) */
     snprintf(path, sizeof(path), "%s/tokenizer.json", model_dir);
     Tokenizer *tk = tokenizer_load(path);
-    if (!tk) fprintf(stderr, "[main] WARNING: tokenizer.json failed to load (using hardcoded prompt)\n");
+    if (!tk) fprintf(stderr, "[main] WARNING: tokenizer.json failed to load\n");
 
     /* 2. Glob-expand images */
     int n_images = 0;
@@ -321,8 +370,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[main] FAILED to find any images matching %s\n", img_glob);
         return 1;
     }
-    /* cap at 4 images to keep runtime <120s (each image triggers a full
-     * forward pass; the activation distributions converge quickly) */
+    /* cap at 4 images to stay under 120s time budget */
     int cap_images = 4;
     if (n_images > cap_images) {
         fprintf(stderr, "[main] capping from %d to %d images for time budget\n", n_images, cap_images);
@@ -346,24 +394,25 @@ int main(int argc, char **argv) {
     }
 
     /* 4. Build the decoder prompt.
-     * Dolphin uses: <s> <s_docvqa> </s> </s> </s>
-     * but the actual tokens depend on the tokenizer. Use a minimal 5-token
-     * prompt: <s> (BOS) + 4 task/eos tokens. */
-    int input_ids[8];
+     * Dolphin prompt: <s> </s> </s> </s> </s> (5 tokens).
+     * We use tokenizer_encode on "</s></s></s></s>" with the BOS special
+     * token prepended manually (the parallel-agent tokenizer does not
+     * auto-wrap with BOS/EOS per its header comments). */
+    int input_ids[16];
     int n_prompt = 0;
     if (tk) {
-        int id_bos = tokenizer_lookup(tk, "<s>");
-        int id_eos = tokenizer_lookup(tk, "</s>");
-        int id_pad = tokenizer_lookup(tk, "<pad>");
-        if (id_bos < 0) id_bos = 0;
-        if (id_eos < 0) id_eos = 2;
-        if (id_pad < 0) id_pad = 1;
-        input_ids[n_prompt++] = id_bos;
-        input_ids[n_prompt++] = id_eos;
-        input_ids[n_prompt++] = id_eos;
-        input_ids[n_prompt++] = id_eos;
-        input_ids[n_prompt++] = id_eos;
-    } else {
+        /* encode "</s></s></s></s>" -> should yield 4 </s> tokens */
+        int enc_len = 0;
+        int *enc = tokenizer_encode(tk, "</s></s></s></s>", &enc_len);
+        if (enc && enc_len > 0) {
+            input_ids[n_prompt++] = 0;  /* <s> = id 0 (verified via test_deps) */
+            for (int i = 0; i < enc_len && n_prompt < 15; i++) {
+                input_ids[n_prompt++] = enc[i];
+            }
+            free(enc);
+        }
+    }
+    if (n_prompt == 0) {
         /* hardcoded fallback */
         input_ids[n_prompt++] = 0;  /* <s> */
         input_ids[n_prompt++] = 2;  /* </s> */
@@ -393,14 +442,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[main] wrote %s\n", path);
     }
 
-    /* 7. Palettize every 2D F16 weight tensor; copy non-palettizable as FP16 */
+    /* 7. Palettize every 2D F16/BF16/F32 weight tensor with the REAL
+     *    Hessian-weighted Lloyd-Max quantizer; copy non-palettizable
+     *    tensors as FP16. */
     snprintf(path, sizeof(path), "%s/palettized", output_dir);
     mkdir_p(path);
-    int n_pal = 0, n_fp16 = 0;
+    int n_pal = 0, n_fp16 = 0, n_skip = 0;
+    clock_t t_pal_start = clock();
     for (int i = 0; i < st->count; i++) {
         TensorInfo *ti = &st->tensors[i];
         void *raw = safetensors_get_ptr(st, ti);
-        if (!raw) continue;
+        if (!raw) { n_skip++; continue; }
         int is_f16 = (strcmp(ti->dtype, "F16") == 0 || strcmp(ti->dtype, "BF16") == 0);
         int is_f32 = (strcmp(ti->dtype, "F32") == 0);
         if (ti->ndim == 2 && (is_f16 || is_f32)) {
@@ -409,25 +461,35 @@ int main(int argc, char **argv) {
             float *W = xmalloc(n * sizeof(float));
             if (is_f16) fp16_to_f32_array(raw, W, n);
             else        memcpy(W, raw, n * sizeof(float));
-            if (palettize_tensor_4bit(W, ti->shape[0], ti->shape[1], path, ti->name) == 0)
+
+            /* find captured Hessian for this tensor */
+            const float *hess = find_hessian(ac, ti->name);
+
+            if (palettize_tensor_lloyd_max(W, hess,
+                                             ti->shape[0], ti->shape[1],
+                                             path, ti->name) == 0) {
                 n_pal++;
-            else
-                fprintf(stderr, "[main]   palettize FAILED for %s\n", ti->name);
+            } else {
+                n_skip++;
+            }
             free(W);
         } else if (ti->ndim == 1 && (is_f16 || is_f32)) {
-            /* bias / norm: write as FP16 */
             if (write_nonpalettizable(raw, ti->n_elements, is_f16, path, ti->name) == 0)
                 n_fp16++;
+            else
+                n_skip++;
+        } else if (is_f16 || is_f32) {
+            if (write_nonpalettizable(raw, ti->n_elements, is_f16, path, ti->name) == 0)
+                n_fp16++;
+            else
+                n_skip++;
         } else {
-            /* I64 index tables, scalars, etc. — also write as FP16 if possible,
-             * else skip */
-            if (is_f16 || is_f32) {
-                if (write_nonpalettizable(raw, ti->n_elements, is_f16, path, ti->name) == 0)
-                    n_fp16++;
-            }
+            n_skip++;
         }
     }
-    fprintf(stderr, "[main] palettized %d tensors, copied %d as FP16\n", n_pal, n_fp16);
+    double t_pal = (double)(clock() - t_pal_start) / CLOCKS_PER_SEC;
+    fprintf(stderr, "[main] palettized %d tensors (lloyd_max, %.2fs), copied %d as FP16, skipped %d\n",
+            n_pal, t_pal, n_fp16, n_skip);
 
     /* cleanup */
     for (int i = 0; i < n_images; i++) {

@@ -104,11 +104,13 @@ void sanitize_name(const char *src, char *dst, size_t dstsz);
  *
  * `lut` points to `groups * palette` float values laid out row-major as
  * lut[g * palette + p]. Each float is converted to IEEE 754 binary16
- * (FP16) and written little-endian. The resulting file is exactly
- * `groups * palette * 2` bytes long.
+ * (FP16) with round-to-nearest, ties-to-even, and written little-endian.
+ * The resulting file is exactly `groups * palette * 2` bytes long.
  *
- * Returns 0 on success, -1 on failure (the file is left in an
- * indeterminate state).
+ * The function returns void. On failure (NULL inputs, non-positive
+ * dimensions, malloc failure, or file open failure) it silently does
+ * nothing; callers can detect failure by stat()-ing the output file
+ * or checking errno.
  */
 void write_lut_fp16(const float *lut, int groups, int palette,
                     const char *path);

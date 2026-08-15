@@ -7,39 +7,44 @@
 /* ===========================================================================
  * metadata.h — Writer for metadata_coreml_pg.json
  *
- * Writes a CoreML-palettization metadata file describing every tensor in
- * the model: its name, shape, dtype, byte size, palettizability, and the
- * activation statistics captured by the forward pass.
- *
- * The downstream CoreML palettization tool consumes this JSON to drive
- * per-tensor bit-width selection and LUT allocation.
+ * Outputs the CoreML per-grouped-channel palettization manifest in the exact
+ * format expected by the downstream CoreML weight extractor.
  * =========================================================================== */
 
-/* Tensor metadata entry. */
+/* Per-tensor palettization result. */
 typedef struct {
-    char    name[512];
-    char    dtype[16];
-    int     ndim;
-    int     shape[8];
-    size_t  n_elements;
-    size_t  byte_size;        /* element_size * n_elements (FP16 = 2) */
-    int     is_2d;             /* 1 if ndim==2 (palettizable candidate) */
-    int     is_palettizable;   /* 1 if 2D and not in the skip list */
-    int     n_samples;         /* captured activation rows (0 if none) */
-    int     in_dim;            /* width of the matmul (weight's input dim) */
-    float   hessian_mean;      /* mean of per-channel hessian diagonal */
-    float   hessian_max;
+    char    name[512];          /* original tensor name */
+    int     out_dim;            /* dense_shape[0] */
+    int     in_dim;             /* dense_shape[1] */
+    int     bitwidth;           /* 4, 6, or 8 */
+    int     group_size;         /* 64, 128, or 256 */
+    int     n_groups;           /* in_dim / group_size */
+    int     consumer_transpose_y; /* true for linear weights (y = x @ W^T) */
+    char    index_file[600];    /* sanitized name + ".idx4" */
+    char    lut_file[600];      /* sanitized name + ".lut_scalar" */
+    char   *sha256_idx;         /* hex hash of .idx4 file (owned) */
+    char   *sha256_lut;         /* hex hash of .lut_scalar file (owned) */
+    size_t  packed_len_bytes;   /* size of packed .idx4 file */
 } TensorMeta;
 
-/* Write metadata_coreml_pg.json to `path` describing every tensor in `st`.
+/* Write metadata_coreml_pg.json to `path`.
  *
- *   st            : loaded SafeTensors
+ *   st            : loaded SafeTensors (for tensor count, unused otherwise)
  *   ac            : ActivationCapture from forward_run (may be NULL)
- *   output_dir    : base output dir (used to compute relative paths to .bin)
+ *   output_dir    : base output dir (unused, kept for API compat)
  *   path          : full path to the metadata JSON file to write
+ *   metas         : array of TensorMeta for each palettized tensor
+ *   n_metas       : number of entries in metas
  *
- * Returns 0 on success, -1 on failure. */
-int metadata_write(const SafeTensors *st, const ActivationCapture *ac,
-                    const char *output_dir, const char *path);
+ * Returns 0 on success, -1 on failure. Frees the sha256_idx/sha256_lut
+ * strings inside metas (they are owned by this call). */
+int metadata_write(
+    const SafeTensors *st,
+    const ActivationCapture *ac,
+    const char *output_dir,
+    const char *path,
+    const TensorMeta *metas,
+    int n_metas
+);
 
 #endif /* METADATA_H */

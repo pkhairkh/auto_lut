@@ -1,10 +1,42 @@
-#include <math.h>
 /* metadata.c — Writer for metadata_coreml_pg.json
  *
- * Walks every tensor in a SafeTensors archive, classifies it as palettizable
- * (2D F16 weight) or non-palettizable (1D norm/bias, I64 index tables, etc.),
- * and emits a JSON manifest with shape/dtype/size + captured activation
- * statistics. */
+ * Outputs the EXACT format expected by the CoreML palettization pipeline:
+ *
+ * {
+ *   "bitwidth": -1,                          // -1 = per-tensor mixed
+ *   "cluster_dim": 1,
+ *   "group_axis": 1,
+ *   "group_size": 128,                       // default group_size
+ *   "nibble_order": "LSB_FIRST",
+ *   "indices_layout": "D0D1",
+ *   "quantization_type": "palettizer_per_grouped_channel",
+ *   "teacher_id": "<model_name>",
+ *   "tensors": {
+ *     "<tensor_name>": {
+ *       "var": "<tensor_name>",
+ *       "dense_shape": [out_dim, in_dim],
+ *       "indices_shape": [out_dim, in_dim],
+ *       "bitwidth": 4,                       // per-tensor: 4, 6, or 8
+ *       "groups": in_dim / group_size,
+ *       "group_axis": 1,
+ *       "group_size": 128,                   // per-tensor group_size
+ *       "nibble_order": "LSB_FIRST",
+ *       "indices_layout": "D0D1",
+ *       "consumer_transpose_y": false,       // true for linear weights (y = x @ W^T)
+ *       "index_file": "<sanitized>.idx4",
+ *       "lut_file": "<sanitized>.lut_scalar",
+ *       "sha256_idx": "...",
+ *       "sha256_lut": "...",
+ *       "packed_len_bytes": ...,
+ *       "idx_payload_offset_used": 0,        // our C tool writes flat files, offset=0
+ *       "lut_payload_offset_used": 0
+ *     },
+ *     ...
+ *   }
+ * }
+ *
+ * Only palettized (2D weight) tensors appear in the "tensors" dict.
+ */
 #include "metadata.h"
 #include "fp16.h"
 
@@ -13,43 +45,15 @@
 #include <string.h>
 #include <math.h>
 
-/* Find an Activation by name (linear scan; counts are small). */
-static const Activation *find_act(const ActivationCapture *ac, const char *name) {
-    if (!ac) return NULL;
-    for (int i = 0; i < ac->n_acts; i++) {
-        if (strncmp(ac->acts[i].name, name, 512) == 0) return &ac->acts[i];
+/* Sanitize a tensor name into a filesystem-safe filename component. */
+static void sanitize_name(const char *src, char *dst, size_t cap) {
+    size_t i = 0;
+    for (; i + 1 < cap && src[i]; i++) {
+        char c = src[i];
+        if (c == '/' || c == '\\' || c == '.' || c == ' ' || c == ':') c = '_';
+        dst[i] = c;
     }
-    return NULL;
-}
-
-/* Compute mean and max of the per-channel Hessian diagonal. */
-static void hessian_stats(const Activation *a, float *mean, float *max) {
-    *mean = 0.0f; *max = 0.0f;
-    if (!a || !a->hessian || a->in_dim <= 0) return;
-    double sum = 0.0;
-    float mx = -1e30f;
-    for (int i = 0; i < a->in_dim; i++) {
-        float v = a->hessian[i];
-        sum += v;
-        if (v > mx) mx = v;
-    }
-    *mean = (isnan(sum) || isinf(sum) || a->in_dim <= 0) ? 0.0f : (float)(sum / a->in_dim);
-    *max  = (mx == -1e30f || isnan(mx) || isinf(mx)) ? 0.0f : mx;
-}
-
-/* Determine if a 2D tensor is palettizable. Excludes:
- *   - relative_position_bias_table (small, special semantics)
- *   - relative_position_index (I64, not a weight)
- *   - embed_positions (would palettize but huge; skip to save time)
- * Actually we palettize ALL 2D F16 tensors — CoreML palettization handles
- * them all. Non-palettizable = anything not 2D F16. */
-static int is_palettizable(const TensorInfo *ti) {
-    if (ti->ndim != 2) return 0;
-    if (strcmp(ti->dtype, "F16") != 0 && strcmp(ti->dtype, "BF16") != 0 &&
-        strcmp(ti->dtype, "F32") != 0) return 0;
-    /* skip relative_position_index (I64) and other non-weights */
-    if (strstr(ti->name, "relative_position_index")) return 0;
-    return 1;
+    dst[i] = 0;
 }
 
 /* Write a JSON string with proper escaping. */
@@ -73,10 +77,15 @@ static void write_json_string(FILE *f, const char *s) {
     fputc('"', f);
 }
 
-int metadata_write(const SafeTensors *st, const ActivationCapture *ac,
-                    const char *output_dir, const char *path) {
+int metadata_write(
+    const SafeTensors *st,
+    const ActivationCapture *ac,
+    const char *output_dir,
+    const char *path,
+    const TensorMeta *metas,
+    int n_metas
+) {
     if (!st || !path) return -1;
-    (void)output_dir;
 
     FILE *f = fopen(path, "w");
     if (!f) {
@@ -84,69 +93,81 @@ int metadata_write(const SafeTensors *st, const ActivationCapture *ac,
         return -1;
     }
 
-    int n_pal = 0, n_nonpal = 0, n_with_act = 0;
-    for (int i = 0; i < st->count; i++) {
-        if (is_palettizable(&st->tensors[i])) n_pal++;
-        else n_nonpal++;
-        if (ac && find_act(ac, st->tensors[i].name)) n_with_act++;
+    /* Determine default group_size (most common among palettized tensors) */
+    int default_gs = 128;
+    if (n_metas > 0) {
+        int gs_counts[3] = {0, 0, 0};  /* 64, 128, 256 */
+        for (int i = 0; i < n_metas; i++) {
+            if (metas[i].group_size == 64)  gs_counts[0]++;
+            else if (metas[i].group_size == 128) gs_counts[1]++;
+            else if (metas[i].group_size == 256) gs_counts[2]++;
+        }
+        int mx = 0;
+        if (gs_counts[0] > mx) { mx = gs_counts[0]; default_gs = 64; }
+        if (gs_counts[1] > mx) { mx = gs_counts[1]; default_gs = 128; }
+        if (gs_counts[2] > mx) { mx = gs_counts[2]; default_gs = 256; }
     }
 
+    /* Top-level fields */
     fprintf(f, "{\n");
-    fprintf(f, "  \"format\": \"auto_lut_coreml_pg_v1\",\n");
-    fprintf(f, "  \"tensor_count\": %d,\n", st->count);
-    fprintf(f, "  \"palettizable_count\": %d,\n", n_pal);
-    fprintf(f, "  \"non_palettizable_count\": %d,\n", n_nonpal);
-    fprintf(f, "  \"captured_count\": %d,\n", n_with_act);
-    fprintf(f, "  \"tensors\": [\n");
+    fprintf(f, "  \"bitwidth\": -1,\n");
+    fprintf(f, "  \"cluster_dim\": 1,\n");
+    fprintf(f, "  \"group_axis\": 1,\n");
+    fprintf(f, "  \"group_size\": %d,\n", default_gs);
+    fprintf(f, "  \"nibble_order\": \"LSB_FIRST\",\n");
+    fprintf(f, "  \"indices_layout\": \"D0D1\",\n");
+    fprintf(f, "  \"quantization_type\": \"palettizer_per_grouped_channel\",\n");
+    fprintf(f, "  \"teacher_id\": \"dolphin\",\n");
+    fprintf(f, "  \"tensors\": {");
 
-    for (int i = 0; i < st->count; i++) {
-        const TensorInfo *ti = &st->tensors[i];
-        int pal = is_palettizable(ti);
-        /* element size in bytes */
-        int elem_size = 2;  /* F16/BF16 */
-        if (strcmp(ti->dtype, "F32") == 0 || strcmp(ti->dtype, "I32") == 0 ||
-            strcmp(ti->dtype, "U32") == 0) elem_size = 4;
-        else if (strcmp(ti->dtype, "F64") == 0 || strcmp(ti->dtype, "I64") == 0 ||
-                 strcmp(ti->dtype, "U64") == 0) elem_size = 8;
-        else if (strcmp(ti->dtype, "I8") == 0 || strcmp(ti->dtype, "U8") == 0 ||
-                 strcmp(ti->dtype, "BOOL") == 0) elem_size = 1;
-        else if (strcmp(ti->dtype, "I16") == 0 || strcmp(ti->dtype, "U16") == 0) elem_size = 2;
-
-        size_t byte_size = ti->n_elements * elem_size;
-
-        const Activation *a = ac ? find_act(ac, ti->name) : NULL;
-        float h_mean = 0.0f, h_max = 0.0f;
-        int n_samples = 0, in_dim = 0;
-        if (a) {
-            hessian_stats(a, &h_mean, &h_max);
-            n_samples = a->n_samples;
-            in_dim = a->in_dim;
-        }
-
-        fprintf(f, "    {");
-        fprintf(f, "\"name\": ");
-        write_json_string(f, ti->name);
-        fprintf(f, ", \"dtype\": \"%s\"", ti->dtype);
-        fprintf(f, ", \"ndim\": %d", ti->ndim);
-        fprintf(f, ", \"shape\": [");
-        for (int d = 0; d < ti->ndim; d++) {
-            fprintf(f, "%d%s", ti->shape[d], (d+1<ti->ndim) ? ", " : "");
-        }
-        fprintf(f, "]");
-        fprintf(f, ", \"n_elements\": %zu", ti->n_elements);
-        fprintf(f, ", \"byte_size\": %zu", byte_size);
-        fprintf(f, ", \"is_2d\": %s", ti->ndim == 2 ? "true" : "false");
-        fprintf(f, ", \"is_palettizable\": %s", pal ? "true" : "false");
-        if (a) {
-            fprintf(f, ", \"n_samples\": %d", n_samples);
-            fprintf(f, ", \"in_dim\": %d", in_dim);
-            fprintf(f, ", \"hessian_mean\": %.6e", (isnan(h_mean) || isinf(h_mean)) ? 0.0f : h_mean);
-            fprintf(f, ", \"hessian_max\": %.6e", (isnan(h_max) || isinf(h_max)) ? 0.0f : h_max);
-        }
-        fprintf(f, "}%s\n", (i+1 < st->count) ? "," : "");
+    /* Write each palettized tensor as a key-value pair */
+    for (int i = 0; i < n_metas; i++) {
+        const TensorMeta *m = &metas[i];
+        if (i > 0) fputc(',', f);
+        fprintf(f, "\n    ");
+        write_json_string(f, m->name);
+        fprintf(f, ": {\n");
+        fprintf(f, "      \"var\": ");
+        write_json_string(f, m->name);
+        fprintf(f, ",\n");
+        fprintf(f, "      \"dense_shape\": [%d, %d],\n", m->out_dim, m->in_dim);
+        fprintf(f, "      \"indices_shape\": [%d, %d],\n", m->out_dim, m->in_dim);
+        fprintf(f, "      \"bitwidth\": %d,\n", m->bitwidth);
+        fprintf(f, "      \"groups\": %d,\n", m->n_groups);
+        fprintf(f, "      \"group_axis\": 1,\n");
+        fprintf(f, "      \"group_size\": %d,\n", m->group_size);
+        fprintf(f, "      \"nibble_order\": \"LSB_FIRST\",\n");
+        fprintf(f, "      \"indices_layout\": \"D0D1\",\n");
+        fprintf(f, "      \"consumer_transpose_y\": %s,\n",
+                m->consumer_transpose_y ? "true" : "false");
+        fprintf(f, "      \"index_file\": ");
+        write_json_string(f, m->index_file);
+        fprintf(f, ",\n");
+        fprintf(f, "      \"lut_file\": ");
+        write_json_string(f, m->lut_file);
+        fprintf(f, ",\n");
+        fprintf(f, "      \"sha256_idx\": ");
+        write_json_string(f, m->sha256_idx ? m->sha256_idx : "");
+        fprintf(f, ",\n");
+        fprintf(f, "      \"sha256_lut\": ");
+        write_json_string(f, m->sha256_lut ? m->sha256_lut : "");
+        fprintf(f, ",\n");
+        fprintf(f, "      \"packed_len_bytes\": %zu,\n", m->packed_len_bytes);
+        fprintf(f, "      \"idx_payload_offset_used\": 0,\n");
+        fprintf(f, "      \"lut_payload_offset_used\": 0\n");
+        fprintf(f, "    }");
     }
-    fprintf(f, "  ]\n");
-    fprintf(f, "}\n");
+
+    fprintf(f, "\n  }\n}\n");
     fclose(f);
+
+    /* Free sha256 strings */
+    for (int i = 0; i < n_metas; i++) {
+        free((void*)metas[i].sha256_idx);
+        free((void*)metas[i].sha256_lut);
+    }
+
+    (void)ac;
+    (void)output_dir;
     return 0;
 }

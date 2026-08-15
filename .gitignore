@@ -1,11 +1,8 @@
-# Build artifacts
 *.o
-/test_json
-/test_json_dod_literal
-/json/test_json
-/json/test_json_dod_literal
-/json/json.o
-
-# Editor / OS
-*.swp
+*.a
+*.so
+test_*
+*.exe
 .DS_Store
+*~
+

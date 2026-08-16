@@ -1,11 +1,10 @@
 /* gptq.c — GPTQ (Optimal Brain Surgeon) weight compensation.
  *
- * Pure C11, no external libs. OpenMP-parallelized row updates.
+ * Pure C11, no external libs. OpenMP-parallelized.
  *
- * Pipeline:
- *   1. Compute H^{-1} via Cholesky decomposition + triangular inverse
- *   2. Column-by-column quantization + compensation (Eq. 2 from GPTQ paper)
- *   3. H^{-1} update via Gaussian elimination (Eq. 3 from GPTQ paper)
+ * Key optimization: don't compute full H^{-1}. Instead, compute the Cholesky
+ * factor L once (O(n³/3)), then for each column q, solve H * x = e_q via
+ * forward/backward substitution (O(n²) per column). Total: O(n³/3 + n² * n_cols).
  */
 #include "gptq.h"
 
@@ -13,10 +12,7 @@
 #include <string.h>
 #include <math.h>
 
-/* ------------------------------------------------------------------ */
-/* Cholesky decomposition: A = L * L^T (in-place, lower triangular)    */
-/* Returns 0 on success, -1 if A is not positive definite.             */
-/* ------------------------------------------------------------------ */
+/* Cholesky decomposition: A = L * L^T (in-place, lower triangular) */
 static int cholesky_decompose(float *A, int n) {
     for (int i = 0; i < n; i++) {
         for (int j = 0; j <= i; j++) {
@@ -34,64 +30,26 @@ static int cholesky_decompose(float *A, int n) {
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Invert lower triangular matrix L in place → L^{-1}                  */
-/* ------------------------------------------------------------------ */
-static void invert_lower_triangular(float *L, int n) {
+/* Solve L * y = b (forward substitution), then L^T * x = y (backward).
+ * Gives x = (L * L^T)^{-1} * b = H^{-1} * b.
+ * This is the q-th column of H^{-1}. */
+static void solve_h_column(const float *L, int n, int q, float *x) {
+    /* Forward: L * y = e_q */
     for (int i = 0; i < n; i++) {
-        L[i * n + i] = 1.0f / L[i * n + i];
-        for (int j = i + 1; j < n; j++) {
-            float sum = 0.0f;
-            for (int k = i; k < j; k++)
-                sum -= L[j * n + k] * L[k * n + i];
-            L[j * n + i] = sum / L[j * n + j];
-        }
+        float sum = (i == q) ? 1.0f : 0.0f;
+        for (int j = 0; j < i; j++)
+            sum -= L[i * n + j] * x[j];
+        x[i] = sum / L[i * n + i];
     }
-}
-
-/* ------------------------------------------------------------------ */
-/* Compute H^{-1} = (L * L^T)^{-1} = L^{-T} * L^{-1}
- * where L is lower triangular (from Cholesky).
- *
- * Input:  H (n×n symmetric positive definite, will be overwritten)
- * Output: H_inv (n×n, must be pre-allocated)
- * ------------------------------------------------------------------ */
-static int cholesky_inverse(const float *H, float *H_inv, int n) {
-    /* Copy H to H_inv with regularization */
-    memcpy(H_inv, H, (size_t)n * n * sizeof(float));
-    for (int i = 0; i < n; i++)
-        H_inv[i * n + i] += 1e-5f;
-
-    /* Cholesky: H_inv = L * L^T (L stored in lower triangle) */
-    if (cholesky_decompose(H_inv, n) != 0)
-        return -1;
-
-    /* Zero out upper triangle (Cholesky only fills lower) */
-    for (int i = 0; i < n; i++)
+    /* Backward: L^T * x = y (in-place) */
+    for (int i = n - 1; i >= 0; i--) {
+        float sum = x[i];
         for (int j = i + 1; j < n; j++)
-            H_inv[i * n + j] = 0.0f;
-
-    /* Invert L in place → H_inv now holds L^{-1} in lower triangle */
-    invert_lower_triangular(H_inv, n);
-
-    /* Compute H^{-1} = L^{-T} * L^{-1}
-     * H_inv[i,j] = sum_k L_inv[k,i] * L_inv[k,j]  (k >= max(i,j)) */
-    float *L_inv = H_inv;  /* alias for readability */
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j <= i; j++) {
-            float sum = 0.0f;
-            for (int k = i; k < n; k++)
-                sum += L_inv[k * n + i] * L_inv[k * n + j];
-            H_inv[i * n + j] = sum;
-            H_inv[j * n + i] = sum;  /* symmetric */
-        }
+            sum -= L[j * n + i] * x[j];
+        x[i] = sum / L[i * n + i];
     }
-    return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* GPTQ compensation                                                   */
-/* ------------------------------------------------------------------ */
 int gptq_compensate(
     float *W, const float *H, int out_dim, int in_dim,
     int bitwidth, int group_size
@@ -101,29 +59,65 @@ int gptq_compensate(
 
     int palette = 1 << bitwidth;
 
-    /* Step 1: Compute H^{-1} via Cholesky */
-    float *H_inv = (float *)malloc((size_t)in_dim * in_dim * sizeof(float));
-    if (!H_inv) return -1;
+    /* Step 1: Cholesky decomposition of H + lambda*I */
+    /* Adaptive regularization for rank-deficient Hessians */
+    double trace = 0.0;
+    for (int i = 0; i < in_dim; i++)
+        trace += H[i * in_dim + i];
+    float lambda = (float)(0.01 * trace / in_dim);
+    if (lambda < 1e-5f) lambda = 1e-5f;
 
-    if (cholesky_inverse(H, H_inv, in_dim) != 0) {
-        /* Cholesky failed — fall back to diagonal H^{-1} */
-        for (int i = 0; i < in_dim; i++) {
-            float d = H[i * in_dim + i];
-            if (fabsf(d) < 1e-12f) d = 1e-12f;
-            for (int j = 0; j < in_dim; j++)
-                H_inv[i * in_dim + j] = (i == j) ? (1.0f / d) : 0.0f;
+    float *L = (float *)calloc((size_t)in_dim * in_dim, sizeof(float));
+    if (!L) return -1;
+    memcpy(L, H, (size_t)in_dim * in_dim * sizeof(float));
+    for (int i = 0; i < in_dim; i++)
+        L[i * in_dim + i] += lambda;
+
+    int cholesky_ok = (cholesky_decompose(L, in_dim) == 0);
+
+    /* If Cholesky failed, use diagonal fallback */
+    if (!cholesky_ok) {
+        free(L);
+        /* Diagonal-only "GPTQ" (no cross-weight compensation) */
+        for (int q = 0; q < in_dim; q++) {
+            int g = q / group_size;
+            int gs = g * group_size;
+            int ge = gs + group_size;
+            if (ge > in_dim) ge = in_dim;
+            float wmin = 1e30f, wmax = -1e30f;
+            for (int o = 0; o < out_dim; o++)
+                for (int j = gs; j < ge; j++) {
+                    float v = W[o * in_dim + j];
+                    if (v < wmin) wmin = v;
+                    if (v > wmax) wmax = v;
+                }
+            if (wmax <= wmin) wmax = wmin + 1e-6f;
+            float scale = (float)(palette - 1) / (wmax - wmin);
+            for (int o = 0; o < out_dim; o++) {
+                float w = W[o * in_dim + q];
+                W[o * in_dim + q] = roundf((w - wmin) * scale) / scale + wmin;
+            }
         }
+        return 0;
     }
 
-    /* Step 2: Column-by-column GPTQ */
+    /* Step 2: Column-by-column GPTQ using on-the-fly H^{-1} column solve */
+    float *h_col = (float *)malloc(in_dim * sizeof(float));
+    if (!h_col) { free(L); return -1; }
+
     for (int q = 0; q < in_dim; q++) {
+        /* Solve H * h_col = e_q -> h_col = H^{-1}[:, q] */
+        solve_h_column(L, in_dim, q, h_col);
+
+        float h_qq = h_col[q];
+        if (fabsf(h_qq) < 1e-12f) h_qq = 1e-12f;
+
         /* Determine group for uniform grid */
         int g = q / group_size;
         int gs = g * group_size;
         int ge = gs + group_size;
         if (ge > in_dim) ge = in_dim;
 
-        /* Compute scale for this group (min/max over all rows in group) */
         float wmin = 1e30f, wmax = -1e30f;
         for (int o = 0; o < out_dim; o++) {
             for (int j = gs; j < ge; j++) {
@@ -135,34 +129,22 @@ int gptq_compensate(
         if (wmax <= wmin) wmax = wmin + 1e-6f;
         float scale = (float)(palette - 1) / (wmax - wmin);
 
-        /* H^{-1} diagonal for this column */
-        float h_qq = H_inv[q * in_dim + q];
-        if (fabsf(h_qq) < 1e-12f) h_qq = 1e-12f;
-
-        /* Quantize column q and compensate remaining columns (all rows) */
+        /* Quantize column q and compensate remaining (parallel over rows) */
         #pragma omp parallel for
         for (int o = 0; o < out_dim; o++) {
             float *row = W + (size_t)o * in_dim;
             float w = row[q];
             float wq = roundf((w - wmin) * scale) / scale + wmin;
             float delta = w - wq;
-
-            /* Compensate remaining columns: W[o, j] -= delta * H_inv[j, q] / h_qq */
             float coeff = delta / h_qq;
             for (int j = q + 1; j < in_dim; j++) {
-                row[j] -= coeff * H_inv[j * in_dim + q];
+                row[j] -= coeff * h_col[j];
             }
-            row[q] = wq;  /* set quantized value */
+            row[q] = wq;
         }
-
-        /* Step 3: Skip per-column H^{-1} update (lazy batch approximation).
-         * The GPTQ paper shows that updating H^{-1} after every column is
-         * a second-order correction. Skipping it (using the initial H^{-1}
-         * for all columns) gives nearly identical results with O(n^2) total
-         * cost instead of O(n^3).
-         * For full accuracy, recompute H^{-1} every 128 columns (lazy batch). */
     }
 
-    free(H_inv);
+    free(h_col);
+    free(L);
     return 0;
 }

@@ -50,7 +50,7 @@ static void solve_h_column(const float *L, int n, int q, float *x) {
     }
 }
 
-int gptq_compensate(
+int gptq_compensate_cpu(
     float *W, const float *H, int out_dim, int in_dim,
     int bitwidth, int group_size
 ) {

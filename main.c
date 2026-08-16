@@ -53,6 +53,7 @@
 #include "kmeans1d.h"
 #include "percentile.h"
 #include "cosine.h"
+#include "accf.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -245,33 +246,136 @@ static float *palettize_gptq(
 /* ------------------------------------------------------------------ */
 /* Simplified bitwidth selection with GPTQ (3-step).                   */
 /* ------------------------------------------------------------------ */
-#define COSINE_THRESHOLD 0.995f
-typedef struct { int bitwidth; int group_size; float cosine_sim; } PalettizeConfig;
 
-static PalettizeConfig select_bitwidth_gptq(
+/* ------------------------------------------------------------------ */
+/* ACCF palettization: kmeans1d initial + ACCF refinement.            */
+/* ------------------------------------------------------------------ */
+
+static float *palettize_accf(
+    const float *W_orig, int out_dim, int in_dim,
+    const float *hessian_diag,
+    int bitwidth, int group_size,
+    uint8_t **idx_out, float **lut_out, int *n_groups_out
+) {
+    int palette = 1 << bitwidth;
+    int n_groups = in_dim / group_size;
+
+    uint8_t *idx = xmalloc((size_t)out_dim * in_dim);
+    float *lut = xmalloc((size_t)n_groups * palette * sizeof(float));
+    float *Wq = xmalloc((size_t)out_dim * in_dim * sizeof(float));
+
+    /* Step 1: Initial kmeans1d clustering */
+    #pragma omp parallel for
+    for (int g = 0; g < n_groups; g++) {
+        int start = g * group_size;
+        int gn = out_dim * group_size;
+        float *gv = xmalloc(gn * sizeof(float));
+        float *gh = NULL;
+        if (hessian_diag) {
+            gh = xmalloc(gn * sizeof(float));
+            for (int o = 0; o < out_dim; o++)
+                for (int j = 0; j < group_size; j++)
+                    gh[o * group_size + j] = hessian_diag[start + j];
+        }
+        for (int o = 0; o < out_dim; o++)
+            for (int j = 0; j < group_size; j++)
+                gv[o * group_size + j] = W_orig[o * in_dim + start + j];
+        float *gl = lut + g * palette;
+        uint8_t *gi = xmalloc(gn);
+        kmeans1d_dp(gv, gh, gn, palette, gl, gi);
+        for (int o = 0; o < out_dim; o++)
+            for (int j = 0; j < group_size; j++) {
+                int w = o * in_dim + start + j;
+                idx[w] = gi[o * group_size + j];
+                Wq[w] = gl[gi[o * group_size + j]];
+            }
+        free(gv); free(gh); free(gi);
+    }
+
+    /* Step 2: ACCF refinement */
+    accf_optimize(W_orig, lut, idx, NULL, hessian_diag,
+                  out_dim, in_dim, n_groups, group_size, palette, 10);
+
+    /* Step 3: Reconstruct Wq from refined palette + indices */
+    for (int g = 0; g < n_groups; g++) {
+        int start = g * group_size;
+        for (int o = 0; o < out_dim; o++)
+            for (int j = 0; j < group_size; j++) {
+                int w = o * in_dim + start + j;
+                Wq[w] = lut[g * palette + idx[w]];
+            }
+    }
+
+    int rem = in_dim % group_size;
+    if (rem > 0) {
+        int start = n_groups * group_size;
+        for (int o = 0; o < out_dim; o++)
+            for (int j = 0; j < rem; j++) {
+                idx[o * in_dim + start + j] = 0;
+                Wq[o * in_dim + start + j] = W_orig[o * in_dim + start + j];
+            }
+    }
+
+    *idx_out = idx; *lut_out = lut; *n_groups_out = n_groups;
+    return Wq;
+}
+
+#define COSINE_THRESHOLD 0.995f
+typedef struct { int bitwidth; int group_size; float cosine_sim; int method; } PalettizeConfig;
+
+#define METHOD_GPTQ 0
+#define METHOD_ACCF 1
+
+static const int PRIORITY_TABLE[9][2] = {
+    {4, 256}, {4, 128}, {4, 64},
+    {6, 256}, {6, 128}, {6, 64},
+    {8, 256}, {8, 128}, {8, 64},
+};
+
+static PalettizeConfig select_bitwidth(
     const float *W, int out_dim, int in_dim,
     const float *hess_mat, const float *hess_diag,
     const float *X, int n_samples
 ) {
-    int configs[3][2] = {{4, 256}, {6, 256}, {8, 256}};
-    for (int p = 0; p < 3; p++) {
-        int bw = configs[p][0], gs = configs[p][1];
+    for (int p = 0; p < 9; p++) {
+        int bw = PRIORITY_TABLE[p][0], gs = PRIORITY_TABLE[p][1];
         if (in_dim < gs) continue;
-        float *Wc = xmalloc((size_t)out_dim * in_dim * sizeof(float));
-        memcpy(Wc, W, (size_t)out_dim * in_dim * sizeof(float));
-        uint8_t *idx = NULL; float *lut = NULL; int ng = 0;
-        float *Wq = palettize_gptq(Wc, out_dim, in_dim, hess_mat, hess_diag, bw, gs, &idx, &lut, &ng);
-        float sim = 0.0f;
-        if (X && n_samples > 0)
-            sim = output_cosine(X, W, Wq, n_samples, out_dim, in_dim);
-        free(Wc); free(idx); free(lut); free(Wq);
-        if (sim >= COSINE_THRESHOLD || p == 2) {
-            PalettizeConfig r = {bw, gs, sim}; return r;
+
+        float best_sim = 0.0f;
+        int best_method = METHOD_GPTQ;
+
+        /* Try GPTQ path */
+        {
+            float *Wc = xmalloc((size_t)out_dim * in_dim * sizeof(float));
+            memcpy(Wc, W, (size_t)out_dim * in_dim * sizeof(float));
+            uint8_t *idx = NULL; float *lut = NULL; int ng = 0;
+            float *Wq = palettize_gptq(Wc, out_dim, in_dim, hess_mat, hess_diag, bw, gs, &idx, &lut, &ng);
+            float sim = 0.0f;
+            if (X && n_samples > 0)
+                sim = output_cosine(X, W, Wq, n_samples, out_dim, in_dim);
+            free(Wc); free(idx); free(lut); free(Wq);
+            if (sim > best_sim) { best_sim = sim; best_method = METHOD_GPTQ; }
+        }
+
+        /* Try ACCF path */
+        {
+            uint8_t *idx = NULL; float *lut = NULL; int ng = 0;
+            float *Wq = palettize_accf(W, out_dim, in_dim, hess_diag, bw, gs, &idx, &lut, &ng);
+            float sim = 0.0f;
+            if (X && n_samples > 0)
+                sim = output_cosine(X, W, Wq, n_samples, out_dim, in_dim);
+            free(idx); free(lut); free(Wq);
+            if (sim > best_sim) { best_sim = sim; best_method = METHOD_ACCF; }
+        }
+
+        if (best_sim >= COSINE_THRESHOLD || p == 8) {
+            PalettizeConfig r = {bw, gs, best_sim, best_method};
+            return r;
         }
     }
-    PalettizeConfig r = {8, 256, 0.0f}; return r;
+    PalettizeConfig r = {8, 64, 0.0f, METHOD_GPTQ};
+    return r;
 }
-
 
 /* Pack indices for a given bitwidth.                                  */
 /*                                                                    */
@@ -338,12 +442,17 @@ static int palettize_and_write(
     const char *out_dir, const char *tensor_name,
     TensorMeta *meta_out
 ) {
-    PalettizeConfig cfg = select_bitwidth_gptq(W, out_dim, in_dim, hess_mat, hess_diag, X, n_samples);
+    PalettizeConfig cfg = select_bitwidth(W, out_dim, in_dim, hess_mat, hess_diag, X, n_samples);
+    uint8_t *idx = NULL; float *lut = NULL; int ng = 0;
+    float *Wq = NULL;
     float *Wc = xmalloc((size_t)out_dim * in_dim * sizeof(float));
     memcpy(Wc, W, (size_t)out_dim * in_dim * sizeof(float));
     clip_outliers(Wc, out_dim, in_dim);
-    uint8_t *idx = NULL; float *lut = NULL; int ng = 0;
-    float *Wq = palettize_gptq(Wc, out_dim, in_dim, hess_mat, hess_diag, cfg.bitwidth, cfg.group_size, &idx, &lut, &ng);
+    if (cfg.method == METHOD_GPTQ) {
+        Wq = palettize_gptq(Wc, out_dim, in_dim, hess_mat, hess_diag, cfg.bitwidth, cfg.group_size, &idx, &lut, &ng);
+    } else {
+        Wq = palettize_accf(Wc, out_dim, in_dim, hess_diag, cfg.bitwidth, cfg.group_size, &idx, &lut, &ng);
+    }
     uint8_t *packed = NULL;
     size_t pb = pack_indices_transposed(idx, out_dim, in_dim, cfg.bitwidth, &packed);
     char san[1024]; sanitize_for_file(tensor_name, san, sizeof(san));

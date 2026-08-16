@@ -49,3 +49,21 @@ int gptq_compensate(
 );
 
 #endif /* GPTQ_H */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+int gptq_compensate_cpu(float *W, const float *H, int out_dim, int in_dim, int bitwidth, int group_size);
+int gptq_compensate_gpu(float *W, const float *H, int out_dim, int in_dim, int bitwidth, int group_size);
+#ifdef __cplusplus
+}
+#endif
+/* CPU and GPU function declarations for dispatch */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int gptq_compensate_cpu(float *W, const float *H, int out_dim, int in_dim, int bitwidth, int group_size);
+int gptq_compensate_gpu(float *W, const float *H, int out_dim, int in_dim, int bitwidth, int group_size);
+#ifdef __cplusplus
+}
+#endif

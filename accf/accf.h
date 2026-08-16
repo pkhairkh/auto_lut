@@ -52,3 +52,21 @@ int accf_optimize(
 );
 
 #endif /* ACCF_H */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+int accf_optimize_cpu(const float *W, float *palette, uint8_t *indices, const float *X, const float *hessian_diag, int out_dim, int in_dim, int n_groups, int group_size, int palette_size, int n_iters);
+int accf_optimize_gpu(const float *W, float *palette, uint8_t *indices, const float *hessian_diag, int out_dim, int in_dim, int n_groups, int group_size, int palette_size, int n_iters);
+#ifdef __cplusplus
+}
+#endif
+/* CPU and GPU function declarations for dispatch */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int accf_optimize_cpu(const float *W, float *palette, uint8_t *indices, const float *X, const float *hessian_diag, int out_dim, int in_dim, int n_groups, int group_size, int palette_size, int n_iters);
+int accf_optimize_gpu(const float *W, float *palette, uint8_t *indices, const float *hessian_diag, int out_dim, int in_dim, int n_groups, int group_size, int palette_size, int n_iters);
+#ifdef __cplusplus
+}
+#endif

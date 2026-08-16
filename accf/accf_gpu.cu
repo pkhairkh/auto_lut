@@ -6,6 +6,9 @@
  */
 #include "accf.h"
 
+
+
+
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <stdio.h>
@@ -70,9 +73,9 @@ __global__ void refine_palette_kernel(
             palette[g * palette_size + k] = (float)(sum_wv[0] / sum_w[0]);
         }
     }
-}
 
 /* ------------------------------------------------------------------ */
+}
 /* CUDA kernel: reassign indices (argmin over palette entries)         */
 /* Each thread handles one (o, j) element.                             */
 /* ------------------------------------------------------------------ */

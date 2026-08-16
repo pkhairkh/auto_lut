@@ -138,6 +138,7 @@ int gptq_compensate_gpu(
 
     /* Step 3: Column-by-column GPTQ */
     float *h_col_host = (float *)malloc(in_dim * sizeof(float));
+    float *W_host_copy = (float *)malloc(W_size);
 
     for (int q = 0; q < in_dim; q++) {
         /* Solve H * h_col = e_q via L * L^T * h_col = e_q
@@ -163,11 +164,11 @@ int gptq_compensate_gpu(
         if (ge > in_dim) ge = in_dim;
 
         /* Compute scale for this group (on host — min/max over group) */
-        CHECK_CUDA(cudaMemcpy(h_col_host, d_W, W_size, cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(W_host_copy, d_W, W_size, cudaMemcpyDeviceToHost));
         float wmin = 1e30f, wmax = -1e30f;
         for (int o = 0; o < out_dim; o++) {
             for (int j = gs; j < ge; j++) {
-                float v = h_col_host[(size_t)o * in_dim + j];
+                float v = W_host_copy[(size_t)o * in_dim + j];
                 if (v < wmin) wmin = v;
                 if (v > wmax) wmax = v;
             }
@@ -187,7 +188,7 @@ int gptq_compensate_gpu(
     CHECK_CUDA(cudaMemcpy(W_host, d_W, W_size, cudaMemcpyDeviceToHost));
 
     /* Cleanup */
-    free(h_col_host);
+    free(h_col_host); free(W_host_copy);
     cudaFree(d_W); cudaFree(d_H); cudaFree(d_L); cudaFree(d_h_col);
     cudaFree(d_info); cudaFree(d_work);
     cusolverDnDestroy(cusolver_handle);

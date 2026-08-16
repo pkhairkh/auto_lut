@@ -22,8 +22,8 @@
  *        Priority 7: bitwidth=8, group_size=256
  *        Priority 8: bitwidth=8, group_size=128
  *        Priority 9: bitwidth=8, group_size=64
- *      For each config, palettize W per-grouped-channel (kmeans via
- *      hessian_lloyd_max per group), dequantize, and compute cosine sim
+ *      For each config, palettize W per-grouped-channel (kmeans1d DP after
+ *      GPTQ compensation, then kmeans1d DP palettization per group)
  *      between X@W^T and X@Wq^T. Pick the first config that meets the
  *      threshold (0.995). If none meet it, use priority 9 (8-bit, gs=64).
  *   6. Write the palettized weights as .idx4 + .lut_scalar files in the
@@ -49,7 +49,8 @@
 #include "forward.h"
 #include "metadata.h"
 #include "pack.h"
-#include "lloyd_max.h"
+#include "gptq.h"
+#include "kmeans1d.h"
 #include "percentile.h"
 #include "cosine.h"
 
@@ -179,186 +180,99 @@ static const Activation *find_activation(const ActivationCapture *ac, const char
 }
 
 /* ------------------------------------------------------------------ */
-/* Per-grouped-channel palettization.                                  */
-/*                                                                    */
-/* Palettize W (out_dim, in_dim) by splitting in_dim into groups of    */
-/* group_size channels, running hessian_lloyd_max on each group's      */
-/* flattened (out_dim * group_size) values, and producing:             */
-/*   - idx: (out_dim, in_dim) uint8 indices in [0, 2^bitwidth)         */
-/*   - lut: (n_groups, 2^bitwidth) float32 centroids                   */
-/*                                                                    */
-/* Returns the dequantized Wq (out_dim, in_dim) for cosine evaluation. */
-/* Caller frees *idx_out and *lut_out and Wq.                          */
+/* GPTQ + kmeans1d palettization.                                     */
 /* ------------------------------------------------------------------ */
-static float *palettize_per_grouped_channel(
-    const float *W, int out_dim, int in_dim,
-    const float *hessian_per_in,  /* (in_dim,) or NULL */
+
+static float *palettize_gptq(
+    float *W, int out_dim, int in_dim,
+    const float *hessian_matrix,
+    const float *hessian_diag,
     int bitwidth, int group_size,
     uint8_t **idx_out, float **lut_out, int *n_groups_out
 ) {
     int palette = 1 << bitwidth;
     int n_groups = in_dim / group_size;
-    int remainder = in_dim % group_size;
-    /* For the remainder, we fold it into the last group (or skip if 0) */
-    if (remainder > 0) {
-        /* If in_dim not divisible by group_size, pad the last group.
-         * For simplicity, we just process the divisible part and copy
-         * the remainder as-is (no palettization). This matches CoreML's
-         * behavior when group_size doesn't divide in_dim evenly. */
+    if (hessian_matrix) {
+        int n_elem = in_dim * in_dim;
+        float *H_scaled = xmalloc(n_elem * sizeof(float));
+        for (int i = 0; i < n_elem; i++) H_scaled[i] = 2.0f * hessian_matrix[i];
+        gptq_compensate(W, H_scaled, out_dim, in_dim, bitwidth, group_size);
+        free(H_scaled);
     }
-
     uint8_t *idx = xmalloc((size_t)out_dim * in_dim);
     float *lut = xmalloc((size_t)n_groups * palette * sizeof(float));
     float *Wq = xmalloc((size_t)out_dim * in_dim * sizeof(float));
-
     #pragma omp parallel for
     for (int g = 0; g < n_groups; g++) {
         int start = g * group_size;
-        int end = start + group_size;
-        /* Extract group values: (out_dim * group_size) floats */
-        int group_n = out_dim * group_size;
-        float *group_vals = xmalloc(group_n * sizeof(float));
-        float *group_hess = xmalloc(group_n * sizeof(float));
-        for (int o = 0; o < out_dim; o++) {
+        int gn = out_dim * group_size;
+        float *gv = xmalloc(gn * sizeof(float));
+        float *gh = NULL;
+        if (hessian_diag) {
+            gh = xmalloc(gn * sizeof(float));
+            for (int o = 0; o < out_dim; o++)
+                for (int j = 0; j < group_size; j++)
+                    gh[o * group_size + j] = hessian_diag[start + j];
+        }
+        for (int o = 0; o < out_dim; o++)
+            for (int j = 0; j < group_size; j++)
+                gv[o * group_size + j] = W[o * in_dim + start + j];
+        float *gl = lut + g * palette;
+        uint8_t *gi = xmalloc(gn);
+        kmeans1d_dp(gv, gh, gn, palette, gl, gi);
+        for (int o = 0; o < out_dim; o++)
             for (int j = 0; j < group_size; j++) {
-                int idx_w = o * in_dim + start + j;
-                group_vals[o * group_size + j] = W[idx_w];
-                group_hess[o * group_size + j] = hessian_per_in ? hessian_per_in[start + j] : 1.0f;
+                int w = o * in_dim + start + j;
+                idx[w] = gi[o * group_size + j];
+                Wq[w] = gl[gi[o * group_size + j]];
             }
-        }
-        /* Run hessian_lloyd_max on this group */
-        float *group_lut = lut + g * palette;
-        uint8_t *group_idx = xmalloc(group_n);
-        float delta = hessian_lloyd_max(group_vals, group_hess, group_n,
-                                         palette, 20, group_lut, group_idx);
-        if (delta < 0.0f) {
-            /* fallback: uniform quantization */
-            float wmin = group_vals[0], wmax = group_vals[0];
-            for (int i = 1; i < group_n; i++) {
-                if (group_vals[i] < wmin) wmin = group_vals[i];
-                if (group_vals[i] > wmax) wmax = group_vals[i];
-            }
-            if (wmax <= wmin) wmax = wmin + 1e-6f;
-            for (int k = 0; k < palette; k++)
-                group_lut[k] = wmin + (wmax - wmin) * (float)k / (palette - 1);
-            float scale = (float)(palette - 1) / (wmax - wmin);
-            for (int i = 0; i < group_n; i++) {
-                int k = (int)floorf((group_vals[i] - wmin) * scale + 0.5f);
-                if (k < 0) k = 0;
-                if (k >= palette) k = palette - 1;
-                group_idx[i] = (uint8_t)k;
-            }
-        }
-        /* Write indices and dequantized values back */
-        for (int o = 0; o < out_dim; o++) {
-            for (int j = 0; j < group_size; j++) {
-                int idx_w = o * in_dim + start + j;
-                idx[idx_w] = group_idx[o * group_size + j];
-                Wq[idx_w] = group_lut[group_idx[o * group_size + j]];
-            }
-        }
-        free(group_vals);
-        free(group_hess);
-        free(group_idx);
+        free(gv); free(gh); free(gi);
     }
-
-    /* Handle remainder: copy as-is (no palettization) */
-    if (remainder > 0) {
+    int rem = in_dim % group_size;
+    if (rem > 0) {
         int start = n_groups * group_size;
-        for (int o = 0; o < out_dim; o++) {
-            for (int j = 0; j < remainder; j++) {
-                int idx_w = o * in_dim + start + j;
-                idx[idx_w] = 0;
-                Wq[idx_w] = W[idx_w];
+        for (int o = 0; o < out_dim; o++)
+            for (int j = 0; j < rem; j++) {
+                idx[o * in_dim + start + j] = 0;
+                Wq[o * in_dim + start + j] = W[o * in_dim + start + j];
             }
-        }
     }
-
-    *idx_out = idx;
-    *lut_out = lut;
-    *n_groups_out = n_groups;
+    *idx_out = idx; *lut_out = lut; *n_groups_out = n_groups;
     return Wq;
 }
 
-/* ------------------------------------------------------------------ */
-/* Sensitivity-based bitwidth selection.                               */
-/*                                                                    */
-/* For each candidate (bitwidth, group_size) in priority order,        */
-/* palettize W, dequantize, compute output cosine similarity          */
-/* (X @ W^T vs X @ Wq^T), and return the first config that meets      */
-/* the threshold. Returns priority 9 (8-bit, gs=64) if none meet it.  */
-/* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Simplified bitwidth selection with GPTQ (3-step).                   */
+/* ------------------------------------------------------------------ */
 #define COSINE_THRESHOLD 0.995f
+typedef struct { int bitwidth; int group_size; float cosine_sim; } PalettizeConfig;
 
-typedef struct {
-    int bitwidth;
-    int group_size;
-    float cosine_sim;
-} PalettizeConfig;
-
-static const PalettizeConfig PRIORITY_TABLE[9] = {
-    {4, 256}, {4, 128}, {4, 64},
-    {6, 256}, {6, 128}, {6, 64},
-    {8, 256}, {8, 128}, {8, 64},
-};
-
-static PalettizeConfig select_bitwidth(
+static PalettizeConfig select_bitwidth_gptq(
     const float *W, int out_dim, int in_dim,
-    const float *hessian_per_in,
-    const float *X, int n_samples, int X_in_dim
+    const float *hess_mat, const float *hess_diag,
+    const float *X, int n_samples
 ) {
-    /* If no activation captured, default to priority 9 (safest) */
-    if (!X || n_samples == 0 || X_in_dim != in_dim) {
-        PalettizeConfig r = {8, 64, 1.0f};
-        return r;
-    }
-
-    /* Subsample activations to keep it fast (max 256 samples) */
-    int use_n = n_samples;
-    const float *use_X = X;
-    float *X_sub = NULL;
-    if (n_samples > 256) {
-        use_n = 256;
-        X_sub = xmalloc((size_t)use_n * in_dim * sizeof(float));
-        /* take first 256 samples (deterministic) */
-        memcpy(X_sub, X, (size_t)use_n * in_dim * sizeof(float));
-        use_X = X_sub;
-    }
-
-    PalettizeConfig best = {8, 64, 0.0f};  /* fallback */
-    for (int p = 0; p < 9; p++) {
-        int bw = PRIORITY_TABLE[p].bitwidth;
-        int gs = PRIORITY_TABLE[p].group_size;
-        if (in_dim < gs) continue;  /* group_size larger than in_dim */
-
-        uint8_t *idx = NULL;
-        float *lut = NULL;
-        int n_groups = 0;
-        float *Wq = palettize_per_grouped_channel(
-            W, out_dim, in_dim, hessian_per_in, bw, gs, &idx, &lut, &n_groups);
-
-        float sim = output_cosine(use_X, W, Wq, use_n, out_dim, in_dim);
-
-        free(idx); free(lut); free(Wq);
-
-        if (sim >= COSINE_THRESHOLD) {
-            if (X_sub) free(X_sub);
-            PalettizeConfig r = {bw, gs, sim};
-            return r;
-        }
-        if (sim > best.cosine_sim) {
-            best.bitwidth = bw;
-            best.group_size = gs;
-            best.cosine_sim = sim;
+    int configs[3][2] = {{4, 256}, {6, 256}, {8, 256}};
+    for (int p = 0; p < 3; p++) {
+        int bw = configs[p][0], gs = configs[p][1];
+        if (in_dim < gs) continue;
+        float *Wc = xmalloc((size_t)out_dim * in_dim * sizeof(float));
+        memcpy(Wc, W, (size_t)out_dim * in_dim * sizeof(float));
+        uint8_t *idx = NULL; float *lut = NULL; int ng = 0;
+        float *Wq = palettize_gptq(Wc, out_dim, in_dim, hess_mat, hess_diag, bw, gs, &idx, &lut, &ng);
+        float sim = 0.0f;
+        if (X && n_samples > 0)
+            sim = output_cosine(X, W, Wq, n_samples, out_dim, in_dim);
+        free(Wc); free(idx); free(lut); free(Wq);
+        if (sim >= COSINE_THRESHOLD || p == 2) {
+            PalettizeConfig r = {bw, gs, sim}; return r;
         }
     }
-
-    if (X_sub) free(X_sub);
-    return best;  /* best effort if none met threshold */
+    PalettizeConfig r = {8, 256, 0.0f}; return r;
 }
 
-/* ------------------------------------------------------------------ */
+
 /* Pack indices for a given bitwidth.                                  */
 /*                                                                    */
 /* Transposes idx from (out_dim, in_dim) to (in_dim, out_dim) per     */
@@ -415,79 +329,48 @@ static char *sha256_file(const char *path) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Palettize one tensor, write outputs, return TensorMeta.             */
+/* Palettize one tensor with GPTQ.                                     */
 /* ------------------------------------------------------------------ */
 static int palettize_and_write(
     const float *W, int out_dim, int in_dim,
-    const float *hessian_per_in,
-    const float *X, int n_samples, int X_in_dim,
+    const float *hess_mat, const float *hess_diag,
+    const float *X, int n_samples,
     const char *out_dir, const char *tensor_name,
     TensorMeta *meta_out
 ) {
-    /* Step 1: select bitwidth via sensitivity priority table */
-    PalettizeConfig cfg = select_bitwidth(W, out_dim, in_dim,
-                                            hessian_per_in, X, n_samples, X_in_dim);
-
-    /* Step 2: clip outliers */
-    float *W_clipped = xmalloc((size_t)out_dim * in_dim * sizeof(float));
-    memcpy(W_clipped, W, (size_t)out_dim * in_dim * sizeof(float));
-    clip_outliers(W_clipped, out_dim, in_dim);
-
-    /* Step 3: final palettization with selected config */
-    uint8_t *idx = NULL;
-    float *lut = NULL;
-    int n_groups = 0;
-    float *Wq = palettize_per_grouped_channel(
-        W_clipped, out_dim, in_dim, hessian_per_in,
-        cfg.bitwidth, cfg.group_size, &idx, &lut, &n_groups);
-
-    /* Step 4: pack indices (transposed) */
+    PalettizeConfig cfg = select_bitwidth_gptq(W, out_dim, in_dim, hess_mat, hess_diag, X, n_samples);
+    float *Wc = xmalloc((size_t)out_dim * in_dim * sizeof(float));
+    memcpy(Wc, W, (size_t)out_dim * in_dim * sizeof(float));
+    clip_outliers(Wc, out_dim, in_dim);
+    uint8_t *idx = NULL; float *lut = NULL; int ng = 0;
+    float *Wq = palettize_gptq(Wc, out_dim, in_dim, hess_mat, hess_diag, cfg.bitwidth, cfg.group_size, &idx, &lut, &ng);
     uint8_t *packed = NULL;
-    size_t packed_bytes = pack_indices_transposed(
-        idx, out_dim, in_dim, cfg.bitwidth, &packed);
-
-    /* Step 5: write .idx4 file */
-    char sanitized[1024];
-    sanitize_for_file(tensor_name, sanitized, sizeof(sanitized));
+    size_t pb = pack_indices_transposed(idx, out_dim, in_dim, cfg.bitwidth, &packed);
+    char san[1024]; sanitize_for_file(tensor_name, san, sizeof(san));
     char path[2048];
-    snprintf(path, sizeof(path), "%s/%s.idx4", out_dir, sanitized);
+    snprintf(path, sizeof(path), "%s/%s.idx4", out_dir, san);
     FILE *f = fopen(path, "wb");
-    if (!f) {
-        free(W_clipped); free(idx); free(lut); free(Wq); free(packed);
-        return -1;
-    }
-    fwrite(packed, 1, packed_bytes, f);
-    fclose(f);
-
-    /* Step 6: write .lut_scalar file (n_groups * 2^bitwidth FP16 entries) */
-    int palette = 1 << cfg.bitwidth;
-    snprintf(path, sizeof(path), "%s/%s.lut_scalar", out_dir, sanitized);
-    write_lut_fp16(lut, n_groups, palette, path);
-
-    /* Step 7: fill TensorMeta */
+    if (!f) { free(Wc); free(idx); free(lut); free(Wq); free(packed); return -1; }
+    fwrite(packed, 1, pb, f); fclose(f);
+    int pal = 1 << cfg.bitwidth;
+    snprintf(path, sizeof(path), "%s/%s.lut_scalar", out_dir, san);
+    write_lut_fp16(lut, ng, pal, path);
     memset(meta_out, 0, sizeof(*meta_out));
     strncpy(meta_out->name, tensor_name, 511);
-    meta_out->out_dim = out_dim;
-    meta_out->in_dim = in_dim;
-    meta_out->bitwidth = cfg.bitwidth;
-    meta_out->group_size = cfg.group_size;
-    meta_out->n_groups = n_groups;
-    /* consumer_transpose_y: true for linear weights (y = x @ W^T).
-     * All our 2D weights are linear weights, so true. */
-    meta_out->consumer_transpose_y = 1;
-    snprintf(meta_out->index_file, sizeof(meta_out->index_file), "%s.idx4", sanitized);
-    snprintf(meta_out->lut_file, sizeof(meta_out->lut_file), "%s.lut_scalar", sanitized);
-    meta_out->packed_len_bytes = packed_bytes;
-
-    /* SHA-256 of output files */
-    snprintf(path, sizeof(path), "%s/%s.idx4", out_dir, sanitized);
+    meta_out->out_dim = out_dim; meta_out->in_dim = in_dim;
+    meta_out->bitwidth = cfg.bitwidth; meta_out->group_size = cfg.group_size;
+    meta_out->n_groups = ng; meta_out->consumer_transpose_y = 1;
+    snprintf(meta_out->index_file, sizeof(meta_out->index_file), "%s.idx4", san);
+    snprintf(meta_out->lut_file, sizeof(meta_out->lut_file), "%s.lut_scalar", san);
+    meta_out->packed_len_bytes = pb;
+    snprintf(path, sizeof(path), "%s/%s.idx4", out_dir, san);
     meta_out->sha256_idx = sha256_file(path);
-    snprintf(path, sizeof(path), "%s/%s.lut_scalar", out_dir, sanitized);
+    snprintf(path, sizeof(path), "%s/%s.lut_scalar", out_dir, san);
     meta_out->sha256_lut = sha256_file(path);
-
-    free(W_clipped); free(idx); free(lut); free(Wq); free(packed);
+    free(Wc); free(idx); free(lut); free(Wq); free(packed);
     return 0;
 }
+
 
 /* Write a non-palettizable tensor as raw FP16 (.fp16 file). */
 static int write_nonpalettizable(
@@ -667,11 +550,12 @@ int main(int argc, char **argv) {
 
             const Activation *act = find_activation(ac, ti->name);
             const float *hess = act ? act->hessian : NULL;
+            const float *hmat = act ? act->hessian_matrix : NULL;
             const float *X = act ? act->data : NULL;
             int n_samples = act ? act->n_samples : 0;
 
             if (palettize_and_write(W, ti->shape[0], ti->shape[1],
-                                      hess, X, n_samples, ti->shape[1],
+                                      hmat, hess, X, n_samples,
                                       path, ti->name, &metas[n_metas]) == 0) {
                 n_metas++;
                 n_pal++;

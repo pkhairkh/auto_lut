@@ -13,7 +13,7 @@
  * prompt, and captures the input activation X (seq_len, in_dim) for every
  * 2D weight tensor just before the corresponding matmul.
  *
- * Captured activations are used downstream by the Lloyd-Max palettizer
+ * Captured activations are used downstream by the GPTQ palettizer
  * to compute per-output-channel Hessians for Hessian-weighted quantization.
  *
  * The implementation is model-agnostic at the weight-resolution layer:
@@ -48,8 +48,10 @@ typedef struct {
     char    name[FORWARD_NAME_MAX];
     int     in_dim;
     int     n_samples;
-    float  *data;       /* n_samples * in_dim floats */
-    float  *hessian;    /* in_dim floats */
+    float  *data;            /* n_samples * in_dim floats */
+    float  *hessian;         /* in_dim floats (diagonal) */
+    float  *hessian_matrix;  /* in_dim * in_dim floats (full H = X^T X), NULL if not computed */
+    int     has_hessian_matrix;
 } Activation;
 
 /* A collection of captured activations plus the model state needed to
@@ -81,7 +83,7 @@ typedef struct {
  *   <output_dir>/activations/<sanitized_name>.bin  (raw float32, n_samples*in_dim)
  *   <output_dir>/activations/manifest.json         (index of all captured tensors)
  *
- * Each .bin file is consumed by the Lloyd-Max palettizer to compute
+ * Each .bin file is consumed by the GPTQ palettizer to compute
  * Hessian weights for the corresponding tensor. */
 ActivationCapture *forward_run(
     SafeTensors *st, JsonValue *cfg,

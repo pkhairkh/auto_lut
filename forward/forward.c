@@ -227,6 +227,13 @@ static Activation *act_find_or_create(ActivationCapture *ac, const char *name, i
     a->n_samples = 0;
     a->data     = xmalloc((size_t)FORWARD_ACT_SAMPLE_CAP * in_dim * sizeof(float));
     a->hessian  = xcalloc(in_dim, sizeof(float));
+    /* Only allocate full Hessian matrix for small in_dim (< 4096) to bound memory */
+    a->hessian_matrix = NULL;
+    a->has_hessian_matrix = 0;
+    if (in_dim <= 4096) {
+        a->hessian_matrix = xcalloc((size_t)in_dim * in_dim, sizeof(float));
+        a->has_hessian_matrix = 1;
+    }
     return a;
 }
 
@@ -254,6 +261,23 @@ static void act_capture(ActivationCapture *ac, const char *name,
         }
         a->hessian[j] += s;
     }
+
+    /* Accumulate full Hessian matrix: H += X^T X (for GPTQ) */
+    if (a->has_hessian_matrix && a->hessian_matrix) {
+        /* H[j, k] += sum_i X[i, j] * X[i, k] (symmetric) */
+        #pragma omp parallel for
+        for (int j = 0; j < in_dim; j++) {
+            for (int k = j; k < in_dim; k++) {
+                float s2 = 0.0f;
+                for (int i = 0; i < take; i++) {
+                    s2 += X[(size_t)i * in_dim + j] * X[(size_t)i * in_dim + k];
+                }
+                a->hessian_matrix[(size_t)j * in_dim + k] += s2;
+                a->hessian_matrix[(size_t)k * in_dim + j] += s2;  /* mirror */
+            }
+        }
+    }
+
     a->n_samples += take;
 }
 

@@ -13,10 +13,10 @@ LDFLAGS  := -fopenmp
 LIBS     := -lm -lz
 
 # Include paths for all modules
-INCLUDES := -Isafetensors -Ifp16 -Ipng -Itokenizer -Ipreprocess -Ipack -Iforward -Illoyd_max -Icosine_percentile
+INCLUDES := -Isafetensors -Ifp16 -Ipng -Itokenizer -Ipreprocess -Ipack -Iforward -Icosine_percentile -Igptq -Ikmeans1d
 
 # Module directories
-MOD_DIRS := safetensors fp16 png tokenizer preprocess pack forward lloyd_max cosine_percentile
+MOD_DIRS := safetensors fp16 png tokenizer preprocess pack forward cosine_percentile gptq kmeans1d
 
 # All .c files across modules (excluding test_*.c and the duplicate tokenizer/json.c)
 # GNU make filter-out with % requires the pattern to match the full word; the
@@ -53,7 +53,6 @@ preprocess/preprocess.o:   preprocess/preprocess.c preprocess/preprocess.h png/p
 pack/pack.o:               pack/pack.c pack/pack.h fp16/fp16.h
 forward/forward.o:         forward/forward.c forward/forward.h safetensors/safetensors.h safetensors/json.h fp16/fp16.h
 forward/metadata.o:        forward/metadata.c forward/metadata.h safetensors/safetensors.h forward/forward.h fp16/fp16.h
-lloyd_max/lloyd_max.o:     lloyd_max/lloyd_max.c lloyd_max/lloyd_max.h
 cosine_percentile/cosine.o:    cosine_percentile/cosine.c cosine_percentile/cosine.h
 cosine_percentile/percentile.o: cosine_percentile/percentile.c cosine_percentile/percentile.h
 
